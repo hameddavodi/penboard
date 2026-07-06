@@ -1,0 +1,17 @@
+# Android
+.gradle/
+android/build/
+android/app/build/
+android/local.properties
+*.apk
+*.keystore
+android/keystore.properties
+android/*.jks
+
+# Swift
+macos/.build/
+macos/build/
+macos/*.app
+
+# macOS
+.DS_Store

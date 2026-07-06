@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">PenBoard</string>
+    <string name="status_permissions_required">Bluetooth permissions required to start PenBoard.</string>
+    <string name="status_starting">Starting…</string>
+    <string name="status_advertising">Advertising — waiting for Mac…</string>
+    <string name="status_advertising_failed">Advertising failed: %1$s</string>
+    <string name="status_connected">Connected to %1$s</string>
+    <string name="status_reconnecting">Reconnecting…</string>
+    <string name="action_grant_permissions">Grant permissions</string>
+    <string name="pairing_title">Confirm on Mac</string>
+    <string name="pairing_instructions">Check that this code matches the one shown on your Mac, then confirm there.</string>
+    <string name="reconnect_banner">Connection lost — reconnecting…</string>
+    <string name="mode_draw">Draw</string>
+    <string name="mode_laser">Laser</string>
+    <string name="width_small">S</string>
+    <string name="width_medium">M</string>
+    <string name="width_large">L</string>
+    <string name="width_xlarge">XL</string>
+    <string name="action_undo">Undo</string>
+    <string name="action_clear">Clear</string>
+    <string name="dim_on">Dim: On</string>
+    <string name="dim_off">Dim: Off</string>
+    <string-array name="palette_names">
+        <item>Red</item>
+        <item>Blue</item>
+        <item>Green</item>
+        <item>Yellow</item>
+        <item>Black</item>
+        <item>White</item>
+    </string-array>
+</resources>

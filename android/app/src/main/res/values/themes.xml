@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- AndroidX appcompat only (decision D2 / dependency policy) — no Material
+         Components library, so this extends Theme.AppCompat, not Theme.Material3. -->
+    <style name="Theme.PenBoard" parent="Theme.AppCompat.DayNight.NoActionBar">
+        <item name="colorPrimary">@color/penboard_accent</item>
+        <item name="android:windowBackground">@color/penboard_background</item>
+        <item name="android:windowFullscreen">true</item>
+        <item name="android:windowNoTitle">true</item>
+    </style>
+
+    <style name="Theme.PenBoard.FullScreenDialog" parent="Theme.AppCompat.DayNight.Dialog">
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowIsFloating">false</item>
+        <item name="android:windowBackground">@color/penboard_background</item>
+        <item name="android:windowCloseOnTouchOutside">false</item>
+    </style>
+</resources>
