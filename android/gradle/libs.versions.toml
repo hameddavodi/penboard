@@ -1,0 +1,28 @@
+[versions]
+agp = "9.2.0"
+# AGP 9's built-in Kotlin support means there is no `kotlin-android` plugin to
+# apply anymore; this version is the source of truth for the buildscript
+# classpath override in the root build.gradle.kts (kept in sync by hand since
+# catalog accessors aren't usable inside `buildscript {}`).
+kotlin = "2.4.0"
+ktfmt-gradle = "0.26.0"
+# 1.17.0 (not the newer 1.19.0) deliberately: androidx.core 1.18.0+ raises its
+# AAR metadata compileSdk requirement to 37/36.1, which conflicts with
+# EXECUTION-PLAN's deliberate compileSdk=36 lock (avoids API 37's tablet
+# orientation/resizability opt-out removal). 1.17.0 is the newest release that
+# still only requires compileSdk 36.
+androidx-core = "1.17.0"
+androidx-appcompat = "1.7.1"
+# Test-only (testImplementation): JVM unit test framework, never packaged into
+# the APK. Does not count against the "AndroidX core/appcompat only" runtime
+# dependency policy (docs/EXECUTION-PLAN.md §0).
+junit = "4.13.2"
+
+[libraries]
+androidx-core = { group = "androidx.core", name = "core", version.ref = "androidx-core" }
+androidx-appcompat = { group = "androidx.appcompat", name = "appcompat", version.ref = "androidx-appcompat" }
+junit = { group = "junit", name = "junit", version.ref = "junit" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+ktfmt = { id = "com.ncorti.ktfmt.gradle", version.ref = "ktfmt-gradle" }

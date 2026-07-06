@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="utf-8"?>
+<merge xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <it.aisma.penboard.ui.PadView
+        android:id="@+id/padView"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:visibility="gone" />
+
+    <it.aisma.penboard.ui.Toolbar
+        android:id="@+id/toolbar"
+        android:layout_width="wrap_content"
+        android:layout_height="match_parent"
+        android:layout_gravity="end"
+        android:visibility="gone" />
+
+    <TextView
+        android:id="@+id/reconnectBanner"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top"
+        android:background="@color/penboard_accent"
+        android:gravity="center"
+        android:padding="12dp"
+        android:text="@string/reconnect_banner"
+        android:textColor="@color/penboard_background"
+        android:textStyle="bold"
+        android:visibility="gone" />
+
+    <LinearLayout
+        android:id="@+id/permissionGate"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="@color/penboard_background"
+        android:gravity="center"
+        android:orientation="vertical"
+        android:padding="32dp">
+
+        <TextView
+            android:id="@+id/statusText"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:gravity="center"
+            android:text="@string/status_starting"
+            android:textColor="@color/penboard_ink"
+            android:textSize="20sp" />
+
+        <Button
+            android:id="@+id/grantPermissionsButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="24dp"
+            android:text="@string/action_grant_permissions"
+            android:visibility="gone" />
+
+    </LinearLayout>
+
+</merge>

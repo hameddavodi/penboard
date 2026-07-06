@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="penboard_ink">#111111</color>
+    <color name="penboard_background">#FFFFFF</color>
+    <color name="penboard_accent">#3B82F6</color>
+    <color name="penboard_toolbar_background">#DD1A1A1A</color>
+</resources>
