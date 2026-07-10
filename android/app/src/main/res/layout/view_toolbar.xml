@@ -88,7 +88,14 @@
             android:id="@+id/dimButton"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
+            android:layout_marginBottom="8dp"
             android:text="@string/dim_off" />
+
+        <Button
+            android:id="@+id/streamButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/stream_off" />
 
     </LinearLayout>
 </merge>

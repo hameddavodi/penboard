@@ -1,0 +1,178 @@
+import Foundation
+import Network
+import os
+
+/// A5/C1-C4 (Feature 2 MVP): the MJPEG-over-HTTP server + Bonjour
+/// advertisement. Own serial queue, same `@unchecked Sendable` +
+/// serial-queue-confinement pattern as `Central`/`ScreenStreamer` — all
+/// mutable state (listener, token, current client) is only ever touched
+/// confined to `queue`, which is also the queue NWListener/NWConnection
+/// deliver their callbacks on (`start(queue:)` on the same queue both times).
+///
+/// R-5: the Bonjour TXT `tok` is the only access control in v1 — no TLS, no
+/// pairing-derived secret (non-goal). R-6: `NWListener(using:on:)` binds all
+/// interfaces; the token path plus a LAN-only threat model is the accepted v1
+/// mitigation (documented in the plan's risk register, not re-litigated here).
+final class MJPEGServer: NSObject, @unchecked Sendable {
+
+    /// C1: Bonjour service type, fixed by contract.
+    private static let serviceType = "_penboard-stream._tcp"
+    /// C3: bounded read of the request line only — the server never reads
+    /// the socket again after that.
+    private static let requestReadCap = 1024
+
+    private let log = Logger(subsystem: "it.aisma.penboard", category: "stream.server")
+    private let queue = DispatchQueue(label: "it.aisma.penboard.stream.server")
+
+    private var listener: NWListener?
+    private var token: String?
+    /// C3: the server holds exactly one streaming client; a new connection
+    /// presenting a valid token replaces (closes) the old one.
+    private var client: NWConnection?
+    /// C4 backpressure: skip a push if the previous one hasn't completed —
+    /// only the latest frame is ever queued for a slow client, never a
+    /// growing buffer.
+    private var isSending = false
+
+    /// Surfaced so `StreamController` (A6) can react to listener failures
+    /// (e.g. the OS refusing to bind/advertise) the same way
+    /// `ScreenStreamer.onStopped` surfaces capture failures. Always fires on
+    /// `queue`.
+    var onFailure: ((Error) -> Void)?
+
+    /// C1/C2: starts listening on an OS-assigned ephemeral port and
+    /// advertises via Bonjour with `token` in the TXT record (C2: `v`/`tok`
+    /// keys). Safe to call again — tears down any previous listener/client
+    /// first (this is also the token-rotation path: a fresh toggle-ON gets a
+    /// fresh token per C2, which is why a stale client must always be
+    /// dropped here rather than kept around).
+    func start(token: String) {
+        let newListener: NWListener
+        do {
+            newListener = try NWListener(using: .tcp, on: .any)
+        } catch {
+            log.error("NWListener creation failed: \(String(describing: error), privacy: .public)")
+            onFailure?(error)
+            return
+        }
+
+        // C2: TXT record — `v` pins the stream-contract version (independent
+        // of the BLE protocol version); unknown keys are ignored by the
+        // tablet, so nothing else needs to go in here for v1.
+        newListener.service = NWListener.Service(
+            name: nil,
+            type: Self.serviceType,
+            domain: nil,
+            txtRecord: NWTXTRecord(["v": "1", "tok": token])
+        )
+        newListener.stateUpdateHandler = { [weak self] state in
+            guard let self else { return }
+            switch state {
+            case .ready:
+                self.log.info("MJPEG listener ready on port \(newListener.port?.rawValue ?? 0, privacy: .public)")
+            case .failed(let error):
+                self.log.error("MJPEG listener failed: \(String(describing: error), privacy: .public)")
+                self.onFailure?(error)
+            default:
+                break
+            }
+        }
+        newListener.newConnectionHandler = { [weak self] connection in
+            self?.handleNewConnection(connection)
+        }
+
+        queue.sync {
+            teardownLocked()
+            self.token = token
+            self.listener = newListener
+        }
+        newListener.start(queue: queue)
+    }
+
+    /// C1: stops serving and withdraws the Bonjour advertisement (implicit on
+    /// listener cancel) plus closes any active client. Idempotent.
+    func stop() {
+        queue.sync {
+            teardownLocked()
+            token = nil
+        }
+    }
+
+    /// C4: pushes one already-JPEG-encoded frame to the current client, if
+    /// any. Safe to call from any thread — `ScreenStreamer.onFrame` fires on
+    /// its own capture queue, not this server's queue — this hops onto
+    /// `queue` itself before touching any state.
+    func push(frame: Data) {
+        queue.async { [weak self] in
+            guard let self, let client = self.client, !self.isSending else { return }
+            self.isSending = true
+            let part = MJPEGWire.part(jpeg: frame)
+            client.send(
+                content: part,
+                completion: .contentProcessed { [weak self] error in
+                    guard let self else { return }
+                    self.queue.async { self.isSending = false }
+                    if let error {
+                        self.log.error("Frame send failed: \(String(describing: error), privacy: .public)")
+                    }
+                }
+            )
+        }
+    }
+
+    /// Must only run confined to `queue` (via `queue.sync` above, or already
+    /// running on `queue` via a listener/connection callback).
+    private func teardownLocked() {
+        client?.cancel()
+        client = nil
+        isSending = false
+        listener?.cancel()
+        listener = nil
+    }
+
+    // MARK: New connections (C3)
+
+    private func handleNewConnection(_ connection: NWConnection) {
+        connection.start(queue: queue)
+        connection.receive(minimumIncompleteLength: 1, maximumLength: Self.requestReadCap) { [weak self] data, _, _, error in
+            guard let self else { return }
+            guard
+                error == nil, let data, let path = MJPEGWire.requestPath(from: data),
+                let token = self.token, MJPEGWire.pathMatches(path: path, token: token)
+            else {
+                self.reject(connection)
+                return
+            }
+            self.adopt(connection)
+        }
+    }
+
+    /// C3: valid token — send the response header and adopt as the single
+    /// streaming client, replacing (closing) whatever client was there
+    /// before. This is also the reconnect path (C3): the tablet just opens a
+    /// fresh connection and the old one gets closed here.
+    private func adopt(_ connection: NWConnection) {
+        client?.cancel()
+        isSending = false
+        client = connection
+        connection.send(
+            content: MJPEGWire.responseHeader(),
+            completion: .contentProcessed { [weak self] error in
+                if let error {
+                    self?.log.error("Header send failed: \(String(describing: error), privacy: .public)")
+                }
+            }
+        )
+        log.info("Streaming client connected")
+    }
+
+    /// C3: wrong method/path/token -> 404 + close immediately, no body.
+    private func reject(_ connection: NWConnection) {
+        connection.send(
+            content: MJPEGWire.notFoundResponse(),
+            completion: .contentProcessed { _ in
+                connection.cancel()
+            }
+        )
+    }
+}

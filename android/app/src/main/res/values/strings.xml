@@ -21,6 +21,9 @@
     <string name="action_clear">Clear</string>
     <string name="dim_on">Dim: On</string>
     <string name="dim_off">Dim: Off</string>
+    <string name="stream_on">Stream: On</string>
+    <string name="stream_off">Stream: Off</string>
+    <string name="stream_looking">Looking for Mac stream…</string>
     <string-array name="palette_names">
         <item>Red</item>
         <item>Blue</item>

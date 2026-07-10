@@ -30,6 +30,16 @@
          it (PenBoardService.hasNotificationPermission()). -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- Mac screen-stream discovery/fetch (EXECUTION-PLAN v1.1, B2): normal
+         permission, no runtime prompt. CHANGE_WIFI_MULTICAST_STATE is not
+         needed: NsdManager brokers mDNS via the system service, only raw
+         MulticastSocket use needs that lock (verified against the fetched
+         NsdManager docs, internal docs). At this
+         targetSdk (36 / Android 16) the new ACCESS_LOCAL_NETWORK permission
+         is opt-in only and INTERNET alone is sufficient; it becomes mandatory
+         at targetSdk 37+, future-upgrade note, no action needed now. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
     <uses-feature
         android:name="android.hardware.bluetooth_le"
         android:required="true" />

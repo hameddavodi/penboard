@@ -43,6 +43,8 @@ constructor(context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
         fun onClearClicked()
 
         fun onDimToggled(enabled: Boolean)
+
+        fun onStreamToggled(enabled: Boolean)
     }
 
     var listener: Listener? = null
@@ -50,11 +52,13 @@ constructor(context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
     private val connectionStatusText: TextView
     private val modeButton: Button
     private val dimButton: Button
+    private val streamButton: Button
     private val swatchViews: List<View>
     private val widthButtons: List<Button>
 
     private var mode = PenBoardPrefs.MODE_DRAW
     private var dimEnabled = false
+    private var streamEnabled = false
     private var selectedColorIndex = Palette.DEFAULT_INDEX
     private var selectedWidth = PenBoardPrefs.DEFAULT_WIDTH
 
@@ -65,6 +69,7 @@ constructor(context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
         connectionStatusText = findViewById(R.id.connectionStatusText)
         modeButton = findViewById(R.id.modeButton)
         dimButton = findViewById(R.id.dimButton)
+        streamButton = findViewById(R.id.streamButton)
         widthButtons =
             listOf(
                 findViewById<Button>(R.id.widthButtonS).apply { tag = WIDTH_SMALL },
@@ -85,6 +90,11 @@ constructor(context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
             applyDimAppearance()
             listener?.onDimToggled(dimEnabled)
         }
+        streamButton.setOnClickListener {
+            streamEnabled = !streamEnabled
+            applyStreamAppearance()
+            listener?.onStreamToggled(streamEnabled)
+        }
         widthButtons.forEach { button ->
             button.setOnClickListener {
                 selectedWidth = button.tag as Int
@@ -97,6 +107,7 @@ constructor(context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
 
         applyModeAppearance()
         applyDimAppearance()
+        applyStreamAppearance()
         applyWidthAppearance()
         applySwatchAppearance()
     }
@@ -123,6 +134,11 @@ constructor(context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
     fun setDimEnabled(enabled: Boolean) {
         dimEnabled = enabled
         applyDimAppearance()
+    }
+
+    fun setStreamEnabled(enabled: Boolean) {
+        streamEnabled = enabled
+        applyStreamAppearance()
     }
 
     private fun buildSwatch(row: LinearLayout, index: Int): View {
@@ -160,6 +176,10 @@ constructor(context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
 
     private fun applyDimAppearance() {
         dimButton.text = resources.getString(if (dimEnabled) R.string.dim_on else R.string.dim_off)
+    }
+
+    private fun applyStreamAppearance() {
+        streamButton.text = resources.getString(if (streamEnabled) R.string.stream_on else R.string.stream_off)
     }
 
     private fun applyWidthAppearance() {

@@ -10,6 +10,7 @@ enum Prefs {
     private static let modeKey = "it.aisma.penboard.mode"
     private static let colorIndexKey = "it.aisma.penboard.colorIndex"
     private static let baseWidthKey = "it.aisma.penboard.baseWidth"
+    private static let selectedDisplayIDKey = "it.aisma.penboard.selectedDisplayID"
 
     /// `CBPeripheral.identifier` of the peripheral the user has confirmed via the
     /// trust dialog (PROTOCOL §6). Never a MAC address — CoreBluetooth identifiers
@@ -56,5 +57,25 @@ enum Prefs {
             return min(max(UInt8(clamping: defaults.integer(forKey: baseWidthKey)), 1), 64)
         }
         set { defaults.set(Int(newValue), forKey: baseWidthKey) }
+    }
+
+    /// C7: the `CGDirectDisplayID` of the user's explicitly-selected display
+    /// (StatusMenu's Display submenu). Absent (nil) means no explicit
+    /// selection has been made -> main display, exact v1.0 behavior.
+    /// `UInt32(exactly:)` on read guards against a corrupted/out-of-range
+    /// stored value the same way `baseWidth`'s defensive clamp does, rather
+    /// than trapping on a bad cast.
+    static var selectedDisplayID: UInt32? {
+        get {
+            guard defaults.object(forKey: selectedDisplayIDKey) != nil else { return nil }
+            return UInt32(exactly: defaults.integer(forKey: selectedDisplayIDKey))
+        }
+        set {
+            if let newValue {
+                defaults.set(Int(newValue), forKey: selectedDisplayIDKey)
+            } else {
+                defaults.removeObject(forKey: selectedDisplayIDKey)
+            }
+        }
     }
 }

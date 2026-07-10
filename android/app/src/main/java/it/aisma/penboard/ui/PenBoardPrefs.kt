@@ -30,12 +30,18 @@ class PenBoardPrefs(context: Context) {
         get() = prefs.getBoolean(KEY_DIM, false)
         set(value) = prefs.edit { putBoolean(KEY_DIM, value) }
 
+    /** Mac screen-stream toggle (EXECUTION-PLAN v1.1, B5) -- tablet-side only; independent of the Mac's own toggle (C6). */
+    var streamEnabled: Boolean
+        get() = prefs.getBoolean(KEY_STREAM, false)
+        set(value) = prefs.edit { putBoolean(KEY_STREAM, value) }
+
     companion object {
         private const val PREFS_NAME = "penboard_settings"
         private const val KEY_MODE = "mode"
         private const val KEY_COLOR = "color_index"
         private const val KEY_WIDTH = "width_base"
         private const val KEY_DIM = "dim_enabled"
+        private const val KEY_STREAM = "stream_enabled"
 
         /** SET_MODE payload values (PROTOCOL §5). */
         const val MODE_DRAW = 0

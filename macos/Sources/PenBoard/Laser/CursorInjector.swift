@@ -10,11 +10,17 @@ import os
 final class CursorInjector {
     private let log = Logger(subsystem: "it.aisma.penboard", category: "cursor")
 
-    /// D1: main display only. Also used to clamp injected positions (PROTOCOL
-    /// §8) — safe to reuse the same AppKit-space frame for both AppKit and
-    /// CGEvent coordinates because the main display's origin is (0, 0) in both
-    /// conventions (see CoordinateMapper).
-    private let displayFrame: CGRect
+    /// A1/A2 (v1.1): any attached display, not just main. Always a CG
+    /// (CoreGraphics global) space frame — see `CoordinateMapper.cgFrame`
+    /// for how a caller derives one from an `NSScreen.frame`. Used both to
+    /// place the injected cursor (`cgEventPoint`) and to clamp it (PROTOCOL
+    /// §8) inside the target display. Mutable via `update(cgDisplayFrame:)`
+    /// (A3: display switch) rather than being reset there, so an in-flight
+    /// `isDown` drag survives a switch — the next point is simply
+    /// remapped/clamped against the new frame instead of losing mouse-down
+    /// state. Conversion math itself stays out of this class — it's all in
+    /// `CoordinateMapper`; this injector only ever holds/forwards the frame.
+    private var cgDisplayFrame: CGRect
 
     private var isDown = false
     private var smoothed: CGPoint?
@@ -25,8 +31,15 @@ final class CursorInjector {
     /// Low-pass factor for hover smoothing only (higher = snappier/less smoothing).
     private let smoothingAlpha = 0.6
 
-    init(displayFrame: CGRect) {
-        self.displayFrame = displayFrame
+    init(cgDisplayFrame: CGRect) {
+        self.cgDisplayFrame = cgDisplayFrame
+    }
+
+    /// A3: re-point injection at a new display's CG frame (menu selection, or
+    /// hotplug fallback/return). Deliberately does not touch `isDown`/
+    /// `smoothed`/click-rate state — see the property doc comment above.
+    func update(cgDisplayFrame: CGRect) {
+        self.cgDisplayFrame = cgDisplayFrame
     }
 
     /// Consumes one POINT_BATCH's points in order (Laser mode only —
@@ -35,8 +48,8 @@ final class CursorInjector {
         for point in points {
             guard let event = point.event else { continue }
             let target = CoordinateMapper.clamp(
-                CoordinateMapper.cgEventPoint(x: point.x, y: point.y, in: displayFrame),
-                to: displayFrame
+                CoordinateMapper.cgEventPoint(x: point.x, y: point.y, inCGFrame: cgDisplayFrame),
+                to: cgDisplayFrame
             )
 
             switch event {

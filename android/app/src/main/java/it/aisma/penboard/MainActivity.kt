@@ -5,6 +5,8 @@ import android.app.Dialog
 import android.content.ComponentName
 import android.content.Intent
 import android.content.ServiceConnection
+import android.graphics.Bitmap
+import android.net.nsd.NsdManager
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
@@ -21,8 +23,11 @@ import androidx.core.view.WindowInsetsControllerCompat
 import it.aisma.penboard.perm.BlePermissions
 import it.aisma.penboard.proto.ControlOpcode
 import it.aisma.penboard.service.PenBoardService
+import it.aisma.penboard.stream.MjpegClient
+import it.aisma.penboard.stream.StreamDiscovery
 import it.aisma.penboard.ui.PadView
 import it.aisma.penboard.ui.PenBoardPrefs
+import it.aisma.penboard.ui.StreamView
 import it.aisma.penboard.ui.Toolbar
 
 /**
@@ -39,8 +44,14 @@ class MainActivity : AppCompatActivity(), PenBoardService.Listener {
     private lateinit var padView: PadView
     private lateinit var toolbar: Toolbar
     private lateinit var reconnectBanner: TextView
+    private lateinit var streamView: StreamView
 
     private val prefs: PenBoardPrefs by lazy { PenBoardPrefs(this) }
+
+    // Mac screen-stream stack (EXECUTION-PLAN v1.1, C6): Activity-scoped, not
+    // PenBoardService -- independent of the BLE link's own lifecycle.
+    private val streamDiscovery: StreamDiscovery by lazy { StreamDiscovery(streamDiscoveryListener) }
+    private val mjpegClient: MjpegClient by lazy { MjpegClient(mjpegClientListener) }
 
     private var service: PenBoardService? = null
     private var pairingDialog: Dialog? = null
@@ -102,6 +113,7 @@ class MainActivity : AppCompatActivity(), PenBoardService.Listener {
         padView = findViewById(R.id.padView)
         toolbar = findViewById(R.id.toolbar)
         reconnectBanner = findViewById(R.id.reconnectBanner)
+        streamView = findViewById(R.id.streamView)
         grantPermissionsButton.setOnClickListener { permissionLauncher.launch(permissionsToRequest()) }
 
         padView.onPoint = { point -> service?.enqueuePoint(point) }
@@ -121,6 +133,8 @@ class MainActivity : AppCompatActivity(), PenBoardService.Listener {
         if (BlePermissions.allGranted(this)) {
             isBound = bindService(PenBoardService.bindingIntent(this), serviceConnection, 0)
         }
+        // Streaming is Wi-Fi/NSD-based (C6) -- independent of BLE permissions.
+        if (prefs.streamEnabled) startStreaming()
     }
 
     override fun onStop() {
@@ -130,6 +144,9 @@ class MainActivity : AppCompatActivity(), PenBoardService.Listener {
             isBound = false
         }
         service = null
+        // Screen off/backgrounded -- no streaming while the pad isn't visible
+        // (B5); unconditional and idempotent, mirrors the BLE unbind above.
+        stopStreaming()
         super.onStop()
     }
 
@@ -235,6 +252,40 @@ class MainActivity : AppCompatActivity(), PenBoardService.Listener {
                 prefs.dimEnabled = enabled
                 applyDim(enabled)
             }
+
+            override fun onStreamToggled(enabled: Boolean) {
+                prefs.streamEnabled = enabled
+                if (enabled) startStreaming() else stopStreaming()
+            }
+        }
+
+    private val streamDiscoveryListener =
+        object : StreamDiscovery.Listener {
+            override fun onEndpoint(host: String, port: Int, token: String) {
+                mjpegClient.start(host, port, token)
+            }
+
+            override fun onLost() {
+                mjpegClient.stop()
+                streamView.clear()
+                streamView.setStatus(getString(R.string.stream_looking))
+            }
+        }
+
+    private val mjpegClientListener =
+        object : MjpegClient.Listener {
+            override fun onFrame(bitmap: Bitmap) {
+                streamView.setStatus(null)
+                streamView.setFrame(bitmap)
+            }
+
+            override fun onStateChanged(state: MjpegClient.State) {
+                when (state) {
+                    MjpegClient.State.CONNECTING, MjpegClient.State.WAITING ->
+                        streamView.setStatus(getString(R.string.stream_looking))
+                    MjpegClient.State.STREAMING -> Unit // status clears once the first frame actually arrives
+                }
+            }
         }
 
     private fun startAndBindService() {
@@ -256,6 +307,7 @@ class MainActivity : AppCompatActivity(), PenBoardService.Listener {
         toolbar.setWidth(prefs.widthBase)
         toolbar.setDimEnabled(prefs.dimEnabled)
         applyDim(prefs.dimEnabled)
+        toolbar.setStreamEnabled(prefs.streamEnabled)
     }
 
     /**
@@ -268,6 +320,22 @@ class MainActivity : AppCompatActivity(), PenBoardService.Listener {
         attrs.screenBrightness =
             if (enabled) WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_OFF else WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
         window.attributes = attrs
+    }
+
+    /** Starts (or idempotently re-confirms) the stream stack: discovery first, [streamDiscoveryListener] starts the MJPEG client once an endpoint resolves. */
+    private fun startStreaming() {
+        streamView.visibility = View.VISIBLE
+        streamView.setStatus(getString(R.string.stream_looking))
+        streamDiscovery.start(getSystemService(NsdManager::class.java))
+    }
+
+    /** Unconditional + idempotent: safe from onStop(), the toolbar toggle, or both in either order. */
+    private fun stopStreaming() {
+        mjpegClient.stop()
+        streamDiscovery.stop()
+        streamView.clear()
+        streamView.setStatus(null)
+        streamView.visibility = View.GONE
     }
 
     private fun showPairingCodeDialog(code: String) {

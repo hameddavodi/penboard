@@ -52,8 +52,12 @@ Store. Or install via adb: `adb install -r penboard.apk`.
 in System Settings → Privacy & Security → Accessibility.
 
 Why these permissions: Bluetooth is the transport; Accessibility is required
-by macOS for any app that moves the mouse. PenBoard has no network access, no
+by macOS for any app that moves the mouse. PenBoard has no internet access, no
 analytics, and collects nothing — see the [security model](docs/ARCHITECTURE.md#security-model).
+The optional screen stream (below) is the one network feature: it serves video
+only on your local network, only while its toggle is on, behind a random
+128-bit URL token that rotates every time you enable it. The stream is not
+encrypted — don't enable it on a Wi-Fi network you don't trust.
 
 ## Using it
 
@@ -65,6 +69,14 @@ analytics, and collects nothing — see the [security model](docs/ARCHITECTURE.m
 | Undo | toolbar | synced |
 | Erase one stroke | hold the pen button, touch the stroke | — |
 | Dim tablet screen, keep link alive | toolbar dim toggle | — |
+| Choose which display to draw on | — | menu bar → Display |
+| See the Mac screen on the tablet | toolbar stream toggle | menu bar → Stream Screen to Tablet |
+
+Screen streaming needs both devices on the same Wi-Fi and a one-time
+**Screen Recording** permission on the Mac (System Settings → Privacy &
+Security → Screen Recording, then relaunch PenBoard). The tablet finds the Mac
+automatically — no IP addresses. Switching the target display clears current
+ink on both devices, same as switching modes.
 
 Presenting in Meet:
 - Sharing a **Chrome tab** → viewers see the cursor only → use **Laser**.

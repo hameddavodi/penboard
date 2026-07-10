@@ -22,4 +22,23 @@ struct PrefsTests {
         Prefs.baseWidth = 30
         #expect(Prefs.baseWidth == 30)
     }
+
+    /// C7: `selectedDisplayID` absent means "no explicit selection" (main
+    /// display, v1.0 behavior) — nil, not 0 or some other sentinel. One test
+    /// function (not split) because Swift Testing runs tests within a suite
+    /// in parallel by default, and split tests hammering the same
+    /// `UserDefaults` key would race each other.
+    @Test func selectedDisplayIDDefaultsToNilAndRoundTrips() {
+        let original = Prefs.selectedDisplayID
+        defer { Prefs.selectedDisplayID = original }
+
+        Prefs.selectedDisplayID = nil
+        #expect(Prefs.selectedDisplayID == nil)
+
+        Prefs.selectedDisplayID = 69732832 // a real CGDirectDisplayID-shaped value
+        #expect(Prefs.selectedDisplayID == 69732832)
+
+        Prefs.selectedDisplayID = nil
+        #expect(Prefs.selectedDisplayID == nil)
+    }
 }
