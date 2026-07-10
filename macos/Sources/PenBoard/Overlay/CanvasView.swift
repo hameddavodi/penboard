@@ -22,6 +22,20 @@ final class CanvasView: NSView {
     /// PROTOCOL §4: force-close an open stroke after 500 ms without new points.
     private static let stallInterval: TimeInterval = 0.5
 
+    // MARK: Completed-stroke render cache
+    //
+    // Without this, `draw(_:)` scans EVERY stroke/segment ever drawn on every
+    // frame, so per-frame cost grows with session length — a 30-min session
+    // degrades to visible lag. Instead, closed strokes are baked once into an
+    // offscreen bitmap; each frame composites that cached image plus only the
+    // still-open stroke, so per-frame cost is flat regardless of history size.
+    private var cacheContext: CGContext?
+    private var cachedImage: CGImage?
+    private var cacheSize: CGSize = .zero
+    private var cacheScale: CGFloat = 0
+    /// Count of leading strokes already baked into `cacheContext` (all closed).
+    private var bakedStrokeCount = 0
+
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
@@ -109,6 +123,7 @@ final class CanvasView: NSView {
     private func eraseIfHit(at point: CGPoint) {
         let tolerance = max(baseWidth, 12)
         if let dirty = strokeStore.eraseStroke(near: point, tolerance: tolerance) {
+            invalidateCache() // a baked stroke was removed — rebuild the cache
             setNeedsDisplay(dirty)
         }
     }
@@ -117,13 +132,31 @@ final class CanvasView: NSView {
 
     func undo() {
         if let dirty = strokeStore.undo() {
+            invalidateCache() // a baked stroke was removed — rebuild the cache
             setNeedsDisplay(dirty)
         }
     }
 
     func clear() {
+        invalidateCache()
         setNeedsDisplay(bounds)
         strokeStore.clear()
+    }
+
+    // MARK: Display retarget (A3: applyDisplay)
+
+    /// Called when the overlay's frame changes (menu selection or hotplug
+    /// re-resolve). Strokes are stored in this view's local point space
+    /// (`CoordinateMapper.overlayPoint` against `bounds` — see `ingest`), so a
+    /// different-sized/repositioned view invalidates every existing stroke's
+    /// geometry: resizing therefore also clears, exactly like the menu/hotkey
+    /// `clear()`, just triggered by the frame change instead of a user action.
+    /// Self-contained (sets its own frame size first) so it's correct even if
+    /// a caller resizes the content view through some other path too — a
+    /// second `setFrameSize` to the same size is a no-op.
+    func resize(to size: CGSize) {
+        setFrameSize(size)
+        clear()
     }
 
     /// PROTOCOL §4: called when `Central` detects a STREAM seq gap — the dropped
@@ -163,12 +196,85 @@ final class CanvasView: NSView {
     // MARK: Drawing
 
     override func draw(_ dirtyRect: NSRect) {
-        for stroke in strokeStore.strokes {
+        ensureCache()
+        bakeNewlyClosedStrokes()
+
+        // Composite the baked history (clipped to dirtyRect by AppKit), then the
+        // still-open stroke live on top. `bakedStrokeCount..<count` is just the
+        // open stroke, if any — everything before it is already in the cache.
+        if cachedImage == nil { cachedImage = cacheContext?.makeImage() }
+        if let image = cachedImage, let cg = NSGraphicsContext.current?.cgContext {
+            cg.draw(image, in: bounds)
+        }
+
+        let strokes = strokeStore.strokes
+        guard bakedStrokeCount < strokes.count else { return }
+        for stroke in strokes[bakedStrokeCount...] {
             stroke.color.setStroke()
             for segment in stroke.segments where segment.bounds.intersects(dirtyRect) {
                 segment.path.stroke()
             }
         }
+    }
+
+    /// (Re)creates the offscreen cache bitmap when the view size or backing scale
+    /// changes; a fresh context means everything must be re-baked.
+    private func ensureCache() {
+        let scale = window?.backingScaleFactor ?? 2
+        let size = bounds.size
+        if cacheContext != nil, cacheSize == size, cacheScale == scale { return }
+
+        let pixelWidth = Int((size.width * scale).rounded())
+        let pixelHeight = Int((size.height * scale).rounded())
+        guard pixelWidth > 0, pixelHeight > 0,
+            let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
+            let context = CGContext(
+                data: nil,
+                width: pixelWidth,
+                height: pixelHeight,
+                bitsPerComponent: 8,
+                bytesPerRow: 0,
+                space: colorSpace,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            )
+        else {
+            cacheContext = nil
+            return
+        }
+        context.scaleBy(x: scale, y: scale)
+        cacheContext = context
+        cacheSize = size
+        cacheScale = scale
+        cachedImage = nil
+        bakedStrokeCount = 0
+    }
+
+    /// Bakes every closed stroke not yet in the cache. Stops at the open stroke
+    /// (always last), which stays live so its in-flight points still render.
+    private func bakeNewlyClosedStrokes() {
+        guard let context = cacheContext else { return }
+        let strokes = strokeStore.strokes
+        let bakeable = (strokes.last?.isOpen == true) ? strokes.count - 1 : strokes.count
+        guard bakedStrokeCount < bakeable else { return }
+
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: false)
+        while bakedStrokeCount < bakeable {
+            let stroke = strokes[bakedStrokeCount]
+            stroke.color.setStroke()
+            for segment in stroke.segments { segment.path.stroke() }
+            bakedStrokeCount += 1
+        }
+        NSGraphicsContext.restoreGraphicsState()
+        cachedImage = nil // baked content changed — regenerate the snapshot
+    }
+
+    /// Discards the baked cache after a removal (undo/erase/clear); the next
+    /// `draw(_:)` re-bakes the remaining strokes from scratch.
+    private func invalidateCache() {
+        bakedStrokeCount = 0
+        cachedImage = nil
+        cacheContext?.clear(CGRect(origin: .zero, size: cacheSize))
     }
 
     // MARK: Debug replay (EXECUTION-PLAN §6 replay harness)

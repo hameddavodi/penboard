@@ -1,6 +1,7 @@
 package it.aisma.penboard.ui
 
 import android.content.Context
+import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
@@ -48,6 +49,16 @@ constructor(context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
         }
     private val letterboxPaint = Paint().apply { color = Color.BLACK }
 
+    // Completed-stroke render cache. Without it, onDraw() re-draws every segment
+    // of every stroke on every frame, and invalidate() fires once per incoming
+    // point -- so a long session degrades to visible lag. Instead, completed
+    // strokes are baked once into this offscreen bitmap; each frame blits the
+    // bitmap plus only the in-progress stroke, keeping per-frame cost flat.
+    private var cacheBitmap: Bitmap? = null
+    private var cacheCanvas: Canvas? = null
+    /** Count of leading [strokes] already baked into [cacheBitmap]. */
+    private var bakedStrokeCount = 0
+
     private val eraserRadiusPx: Float
         get() = ERASER_RADIUS_DP * resources.displayMetrics.density
 
@@ -73,6 +84,7 @@ constructor(context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
     fun undoLastStroke() {
         if (strokes.isNotEmpty()) {
             strokes.removeAt(strokes.size - 1)
+            invalidateCache() // a baked stroke was removed -- rebuild the cache
             invalidate()
         }
     }
@@ -81,6 +93,7 @@ constructor(context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
     fun clearAllStrokes() {
         strokes.clear()
         currentStroke = null
+        invalidateCache()
         invalidate()
     }
 
@@ -88,6 +101,10 @@ constructor(context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
         super.onSizeChanged(w, h, oldw, oldh)
         if (w > 0 && h > 0) {
             activeRect = PadCoordinateMapper.activeRect(w, h)
+            cacheBitmap?.recycle()
+            cacheBitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+            cacheCanvas = Canvas(cacheBitmap!!)
+            bakedStrokeCount = 0
         }
     }
 
@@ -163,6 +180,7 @@ constructor(context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
         val topmostIndex = strokes.indexOfLast { it.hitTest(x, y, eraserRadiusPx) }
         if (topmostIndex != -1) {
             strokes.removeAt(topmostIndex)
+            invalidateCache() // a baked stroke was removed -- rebuild the cache
             invalidate()
         }
     }
@@ -180,8 +198,29 @@ constructor(context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
         drawLetterboxBars(canvas)
-        for (stroke in strokes) stroke.draw(canvas, strokePaint)
+        bakeCommittedStrokes()
+        cacheBitmap?.let { canvas.drawBitmap(it, 0f, 0f, null) }
         currentStroke?.draw(canvas, strokePaint)
+    }
+
+    /**
+     * Bakes every completed stroke not yet in [cacheBitmap]. Runs only when new
+     * strokes have been added since the last frame; while a stroke is in
+     * progress nothing bakes, so each frame just blits the bitmap plus the live
+     * [currentStroke].
+     */
+    private fun bakeCommittedStrokes() {
+        val target = cacheCanvas ?: return
+        while (bakedStrokeCount < strokes.size) {
+            strokes[bakedStrokeCount].draw(target, strokePaint)
+            bakedStrokeCount++
+        }
+    }
+
+    /** Clears the cache after a removal (undo/erase/clear) so it re-bakes the remaining strokes. */
+    private fun invalidateCache() {
+        cacheBitmap?.eraseColor(Color.TRANSPARENT)
+        bakedStrokeCount = 0
     }
 
     private fun drawLetterboxBars(canvas: Canvas) {
