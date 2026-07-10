@@ -8,8 +8,10 @@ import android.app.PendingIntent
 import android.app.Service
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothManager
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.os.Binder
@@ -90,22 +92,73 @@ class PenBoardService : Service() {
     private var everConnected = false
     private var reconnectBackoffMs = INITIAL_RECONNECT_BACKOFF_MS
 
+    /**
+     * The GATT server/advertiser handle can go stale without any callback telling
+     * us (adapter power-cycled, bluetoothd restarted, or the app simply sat
+     * backgrounded for days) -- STATE_OFF tears the stack down, STATE_ON rebuilds
+     * it, so a zombie link never survives past the next adapter toggle.
+     */
+    private val bluetoothStateReceiver =
+        object : BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) {
+                when (intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, -1)) {
+                    BluetoothAdapter.STATE_ON -> {
+                        Log.i(TAG, "Bluetooth adapter turned on -- rebuilding BLE stack")
+                        restartBleStack()
+                    }
+                    BluetoothAdapter.STATE_OFF -> {
+                        Log.w(TAG, "Bluetooth adapter turned off -- tearing down BLE stack")
+                        mainHandler.removeCallbacksAndMessages(null)
+                        penAdvertiser?.stop()
+                        penGattServer?.stop()
+                        penAdvertiser = null
+                        penGattServer = null
+                        updateStatus(ConnectionStatus())
+                    }
+                }
+            }
+        }
+
     override fun onBind(intent: Intent?): IBinder = binder
 
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, buildNotification(status), foregroundServiceType())
+        ContextCompat.registerReceiver(
+            this,
+            bluetoothStateReceiver,
+            IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED),
+            ContextCompat.RECEIVER_NOT_EXPORTED,
+        )
         startBleStack()
     }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
+    /**
+     * MainActivity calls startForegroundService() on every app launch, including
+     * against this already-running (START_STICKY) instance days later -- onCreate
+     * only ever runs once, so this is what notices a dead/never-started stack
+     * (e.g. after sitting backgrounded for days) and rebuilds it. Force-stopping
+     * the app used to be the only way to get a fresh stack; this makes that
+     * unnecessary.
+     */
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        ensureBleStackRunning()
+        return START_STICKY
+    }
 
     override fun onDestroy() {
+        unregisterReceiver(bluetoothStateReceiver)
         mainHandler.removeCallbacksAndMessages(null)
         penAdvertiser?.stop()
         penGattServer?.stop()
         super.onDestroy()
+    }
+
+    /** Swiping the app away leaves this a zombie foreground service for days -- stop cleanly so the next launch always gets a fresh onCreate() rebuild. */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        stopSelf()
+        super.onTaskRemoved(rootIntent)
     }
 
     fun setListener(newListener: Listener?) {
@@ -202,6 +255,41 @@ class PenBoardService : Service() {
         advertiser.start { success, reason ->
             updateStatus(status.copy(advertising = success, advertiseFailureReason = reason))
         }
+    }
+
+    /** Tears down and rebuilds the whole BLE stack -- used when the existing GATT server/advertiser handle may be stale rather than trusted. */
+    private fun restartBleStack() {
+        penAdvertiser?.stop()
+        penGattServer?.stop()
+        penAdvertiser = null
+        penGattServer = null
+        everConnected = false
+        reconnectBackoffMs = INITIAL_RECONNECT_BACKOFF_MS
+        updateStatus(ConnectionStatus())
+        startBleStack()
+    }
+
+    /** Called from [onStartCommand]: rebuilds the stack if it never started, or if it's sitting idle (not connected, handle possibly stale) rather than trusting a days-old handle. A live connection is left untouched. */
+    private fun ensureBleStackRunning() {
+        if (!BlePermissions.allGranted(this)) {
+            Log.w(TAG, "BLE permissions missing, not starting the peripheral stack")
+            return
+        }
+        val bluetoothManager = getSystemService(BluetoothManager::class.java)
+        val adapter: BluetoothAdapter? = bluetoothManager.adapter
+        if (adapter == null || !adapter.isEnabled) {
+            Log.w(TAG, "Bluetooth adapter unavailable or disabled")
+            return
+        }
+        if (penGattServer == null) {
+            startBleStack()
+            return
+        }
+        if (status.connectedDeviceName != null) {
+            return
+        }
+        Log.i(TAG, "BLE stack idle on (re)launch -- rebuilding in case the GATT server/advertiser handle went stale")
+        restartBleStack()
     }
 
     /** Re-advertises after a disconnect with exponential backoff (M4.1: "sensible retry"), capped and reset on success. */

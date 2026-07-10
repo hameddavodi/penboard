@@ -99,6 +99,7 @@ final class Central: NSObject, @unchecked Sendable {
 
     private var reconnectAttempt = 0
     private var reconnectWorkItem: DispatchWorkItem?
+    private var connectTimeoutTimer: DispatchSourceTimer?
 
     private var activityToken: NSObjectProtocol?
 
@@ -168,7 +169,17 @@ final class Central: NSObject, @unchecked Sendable {
         guard manager.state == .poweredOn else { return }
         guard case .idle = phase else { return }
 
-        if let trustedID = Prefs.trustedPeripheralID,
+        // Only the first attempt (reconnectAttempt == 0, i.e. right after
+        // userInitiatedConnect()/onConnected() reset it) tries the fast
+        // identifier-based path. retrievePeripherals(withIdentifiers:) reads
+        // from a local, mostly-static cache, so if that peripheral isn't
+        // actually reachable (BLE stack just reset after a reboot, tablet's
+        // resolvable address hasn't been re-resolved yet, ...) every retry
+        // would otherwise ask for the exact same unreachable peripheral
+        // forever. Falling back to a live scan after the first failure finds
+        // the tablet by whatever address it's currently advertising under.
+        if reconnectAttempt == 0,
+            let trustedID = Prefs.trustedPeripheralID,
             let existing = manager.retrievePeripherals(withIdentifiers: [trustedID]).first
         {
             log.info("Reconnecting to trusted peripheral by identifier")
@@ -188,6 +199,34 @@ final class Central: NSObject, @unchecked Sendable {
         peripheral.delegate = self
         phase = .connecting
         manager.connect(peripheral, options: nil)
+        armConnectTimeout()
+    }
+
+    /// CoreBluetooth connect attempts never time out on their own (Apple docs:
+    /// "connection attempts don't time out"). Without a local watchdog, a
+    /// peripheral that's unreachable under its retained identifier — common
+    /// right after a reboot or Bluetooth reset — parks the state machine in
+    /// `.connecting` forever with no error ever reported.
+    private static let connectTimeoutSeconds: TimeInterval = 10
+
+    private func armConnectTimeout() {
+        connectTimeoutTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + Self.connectTimeoutSeconds)
+        timer.setEventHandler { [weak self] in self?.handleConnectTimeout() }
+        connectTimeoutTimer = timer
+        timer.resume()
+    }
+
+    /// Cancelling a still-pending (not yet `didConnect`) connection reports
+    /// through `didFailToConnect`, not `didDisconnectPeripheral` — so this
+    /// routes into the existing `scheduleReconnect()` backoff/retry path,
+    /// which (per `beginConnectionAttempt()` above) now falls back to
+    /// scanning on the next attempt.
+    private func handleConnectTimeout() {
+        guard case .connecting = phase else { return }
+        log.error("Connect attempt timed out — cancelling and retrying")
+        cancelConnection()
     }
 
     /// Cancels the link and lets `centralManager(_:didDisconnectPeripheral:error:)`
@@ -224,6 +263,8 @@ final class Central: NSObject, @unchecked Sendable {
         missedPongCount = 0
         handshakeTimeoutTimer?.cancel()
         handshakeTimeoutTimer = nil
+        connectTimeoutTimer?.cancel()
+        connectTimeoutTimer = nil
         lastStreamSeq = nil
         infoCharacteristic = nil
         controlCharacteristic = nil
@@ -573,7 +614,17 @@ extension Central: CBCentralManagerDelegate {
             log.error("Bluetooth unsupported on this Mac")
             phase = .idle
         case .resetting:
-            log.info("Bluetooth resetting")
+            // bluetoothd restarting (common around reboot/wake/sleep) drops any
+            // in-flight peripheral references without a didDisconnect callback.
+            // Without resetting phase to .idle here, the later .poweredOn
+            // callback's `guard case .idle = phase` in beginConnectionAttempt()
+            // silently no-ops forever, leaving the app looking "connected" or
+            // "pairing" while the link is actually gone until relaunch.
+            log.error("Bluetooth resetting — tearing down and waiting for poweredOn")
+            teardownSession()
+            reconnectWorkItem?.cancel()
+            peripheral = nil
+            phase = .idle
         case .unknown:
             log.info("Bluetooth state unknown")
         @unknown default:
@@ -594,12 +645,16 @@ extension Central: CBCentralManagerDelegate {
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        connectTimeoutTimer?.cancel()
+        connectTimeoutTimer = nil
         log.info("Link-layer connected — discovering services")
         phase = .discoveringServices
         peripheral.discoverServices([Self.serviceUUID])
     }
 
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: (any Error)?) {
+        connectTimeoutTimer?.cancel()
+        connectTimeoutTimer = nil
         log.error("Failed to connect: \(String(describing: error), privacy: .public)")
         scheduleReconnect()
     }
