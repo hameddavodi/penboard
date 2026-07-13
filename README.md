@@ -1,13 +1,17 @@
 # PenBoard
 
+[![Latest release](https://img.shields.io/github/v/release/hameddavodi/penboard?label=download&sort=semver)](../../releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 ![Android](https://img.shields.io/badge/Android-10%2B-3DDC84?logo=android&logoColor=white)
 ![macOS](https://img.shields.io/badge/macOS-13%2B-000?logo=apple)
 
 Turn an Android tablet with a stylus into a pen board for your Mac — over
-Bluetooth, no cables, no Wi-Fi needed.
+Bluetooth, no cables, no Wi-Fi needed. Pressure-sensitive on-screen annotation
+and a pen-driven laser pointer for presentations, teaching, and screen sharing.
 
-<!-- TODO: demo GIF here -->
+**➡️ [Download the latest release](../../releases/latest)** (Mac app + tablet APK)
+
+<!-- demo GIF -->
 
 Two modes, toggled from the tablet toolbar, the Mac menu bar, or ⌥⌘D:
 
@@ -130,8 +134,13 @@ Details: [Architecture](docs/ARCHITECTURE.md) ·
 
 ## Support
 
-If PenBoard is useful to you, you can
-[buy me a coffee](https://buymeacoffee.com/your-username) ☕ <!-- TODO: real link -->
+PenBoard is free and open source. If it's useful to you, starring the repo ⭐
+helps others find it.
+
+<!-- To add a Buy Me a Coffee button: put your handle below and also set
+     `buy_me_a_coffee:` in .github/FUNDING.yml.
+[☕ Buy me a coffee](https://buymeacoffee.com/YOUR_HANDLE)
+-->
 
 ## License
 
