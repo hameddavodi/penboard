@@ -1,0 +1,102 @@
+# Release: on a v* tag, build both halves and publish a GitHub release.
+#
+# APK signing: android/keystore.properties is gitignored, so on CI the build
+# falls back to debug signing (see app/build.gradle.kts). A debug-signed
+# release APK cannot update an install signed with the real release key —
+# users must uninstall first. To ship release-signed APKs from CI, add the
+# keystore as repo secrets and materialize keystore.properties in a step
+# before the Gradle build.
+#
+# .app signing: the runner keychain has no "PenBoard Dev" certificate, so
+# build-app.sh falls back to ad-hoc signing — same right-click → Open
+# first-launch flow as before; TCC grants (Bluetooth/Accessibility) from a
+# previous install may be re-prompted once.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Accept Android SDK licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+      - name: Build release APK
+        working-directory: android
+        run: ./gradlew :app:assembleRelease
+      - name: Stage artifact
+        run: cp android/app/build/outputs/apk/release/app-release.apk penboard.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: penboard-apk
+          path: penboard.apk
+          if-no-files-found: error
+
+  app:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and assemble app bundle
+        working-directory: macos
+        run: ./scripts/build-app.sh
+      - name: Zip app bundle
+        # ditto preserves the bundle structure, symlinks and metadata the way
+        # Archive Utility expects — plain zip can produce a bundle Gatekeeper
+        # rejects outright.
+        working-directory: macos/build
+        run: ditto -c -k --keepParent PenBoard.app PenBoard.app.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: penboard-app
+          path: macos/build/PenBoard.app.zip
+          if-no-files-found: error
+
+  release:
+    needs: [apk, app]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Compute checksums
+        id: sums
+        run: |
+          {
+            echo 'sums<<EOF'
+            sha256sum penboard.apk PenBoard.app.zip
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUMS: ${{ steps.sums.outputs.sums }}
+        run: |
+          # Notes file lives in the repo at the tag; this job has no checkout,
+          # so fetch it from the tag ref (fall back to a bare title).
+          gh api "repos/${GITHUB_REPOSITORY}/contents/.github/RELEASE_NOTES.md?ref=${GITHUB_REF_NAME}" \
+            --jq '.content' | base64 -d > notes.md || echo "PenBoard ${GITHUB_REF_NAME}" > notes.md
+          {
+            cat notes.md
+            echo
+            echo '## Verify your download (optional)'
+            echo
+            echo '```'
+            echo "SHA-256"
+            echo "$SUMS"
+            echo '```'
+          } > body.md
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "PenBoard ${GITHUB_REF_NAME#v}" \
+            --notes-file body.md \
+            penboard.apk PenBoard.app.zip
