@@ -88,6 +88,9 @@ class PenBoardService : Service() {
     private var penGattServer: PenGattServer? = null
     private var penAdvertiser: PenAdvertiser? = null
 
+    /** Guards onDestroy's unregister when onCreate bailed before registering (startForeground rejected). */
+    private var receiverRegistered = false
+
     /** True once a device has connected at least once this service lifetime (M4.1 reconnect banner/backoff). */
     private var everConnected = false
     private var reconnectBackoffMs = INITIAL_RECONNECT_BACKOFF_MS
@@ -113,7 +116,7 @@ class PenBoardService : Service() {
                         penGattServer?.stop()
                         penAdvertiser = null
                         penGattServer = null
-                        updateStatus(ConnectionStatus())
+                        updateStatus { ConnectionStatus() }
                     }
                 }
             }
@@ -124,13 +127,25 @@ class PenBoardService : Service() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
-        startForeground(NOTIFICATION_ID, buildNotification(status), foregroundServiceType())
+        try {
+            startForeground(NOTIFICATION_ID, buildNotification(status), foregroundServiceType())
+        } catch (e: SecurityException) {
+            // START_STICKY restart after the user revoked the Bluetooth
+            // runtime permission: the connectedDevice foreground type then
+            // rejects startForeground, and without this catch the service
+            // crash-loops (crash -> sticky restart -> crash). Stop cleanly;
+            // the next real app launch re-checks permissions and restarts us.
+            Log.e(TAG, "startForeground rejected (permission revoked?) -- stopping service", e)
+            stopSelf()
+            return
+        }
         ContextCompat.registerReceiver(
             this,
             bluetoothStateReceiver,
             IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED),
             ContextCompat.RECEIVER_NOT_EXPORTED,
         )
+        receiverRegistered = true
         startBleStack()
     }
 
@@ -148,7 +163,7 @@ class PenBoardService : Service() {
     }
 
     override fun onDestroy() {
-        unregisterReceiver(bluetoothStateReceiver)
+        if (receiverRegistered) unregisterReceiver(bluetoothStateReceiver)
         mainHandler.removeCallbacksAndMessages(null)
         penAdvertiser?.stop()
         penGattServer?.stop()
@@ -194,22 +209,27 @@ class PenBoardService : Service() {
             PenGattServer(
                 object : PenGattServer.Callback {
                     override fun onConnectionStateChanged(deviceName: String?) {
-                        if (deviceName != null) {
-                            everConnected = true
-                            reconnectBackoffMs = INITIAL_RECONNECT_BACKOFF_MS
-                            updateStatus(status.copy(connectedDeviceName = deviceName, reconnecting = false))
-                        } else {
-                            // The link is gone, so any pairing code cached
-                            // from an in-progress handshake is dead -- a
-                            // stale code must not resurface if the activity
-                            // (re)attaches before a fresh HELLO arrives.
-                            pendingPairingCode = null
-                            updateStatus(status.copy(connectedDeviceName = null, reconnecting = everConnected))
-                            // R1 (EXECUTION-PLAN.md): the peripheral typically
-                            // stops advertising once a central connects, so it
-                            // must be explicitly restarted after a disconnect
-                            // to become discoverable again.
-                            if (everConnected) scheduleReadvertise()
+                        // Hop to main: everConnected/reconnectBackoffMs/
+                        // scheduleReadvertise are main-confined, and this
+                        // callback arrives on a binder thread.
+                        mainHandler.post {
+                            if (deviceName != null) {
+                                everConnected = true
+                                reconnectBackoffMs = INITIAL_RECONNECT_BACKOFF_MS
+                                updateStatus { it.copy(connectedDeviceName = deviceName, reconnecting = false) }
+                            } else {
+                                // The link is gone, so any pairing code cached
+                                // from an in-progress handshake is dead -- a
+                                // stale code must not resurface if the activity
+                                // (re)attaches before a fresh HELLO arrives.
+                                pendingPairingCode = null
+                                updateStatus { it.copy(connectedDeviceName = null, reconnecting = everConnected) }
+                                // R1 (EXECUTION-PLAN.md): the peripheral typically
+                                // stops advertising once a central connects, so it
+                                // must be explicitly restarted after a disconnect
+                                // to become discoverable again.
+                                if (everConnected) scheduleReadvertise()
+                            }
                         }
                     }
 
@@ -247,13 +267,18 @@ class PenBoardService : Service() {
 
         if (!gattServer.start(this, bluetoothManager)) {
             Log.e(TAG, "failed to start GATT server")
+            // Release the half-started server (open handle + keepalive loop)
+            // and null the reference so ensureBleStackRunning's == null branch
+            // can rebuild on the next launch.
+            gattServer.stop()
+            penGattServer = null
             return
         }
 
         val advertiser = PenAdvertiser(adapter)
         penAdvertiser = advertiser
         advertiser.start { success, reason ->
-            updateStatus(status.copy(advertising = success, advertiseFailureReason = reason))
+            updateStatus { it.copy(advertising = success, advertiseFailureReason = reason) }
         }
     }
 
@@ -265,7 +290,7 @@ class PenBoardService : Service() {
         penGattServer = null
         everConnected = false
         reconnectBackoffMs = INITIAL_RECONNECT_BACKOFF_MS
-        updateStatus(ConnectionStatus())
+        updateStatus { ConnectionStatus() }
         startBleStack()
     }
 
@@ -298,7 +323,7 @@ class PenBoardService : Service() {
             {
                 val advertiser = penAdvertiser ?: return@postDelayed
                 advertiser.start { success, reason ->
-                    updateStatus(status.copy(advertising = success, advertiseFailureReason = reason))
+                    updateStatus { it.copy(advertising = success, advertiseFailureReason = reason) }
                     if (success) {
                         reconnectBackoffMs = INITIAL_RECONNECT_BACKOFF_MS
                     } else {
@@ -311,9 +336,17 @@ class PenBoardService : Service() {
         )
     }
 
-    private fun updateStatus(newStatus: ConnectionStatus) {
-        status = newStatus
+    /**
+     * All status updates are expressed as transforms and applied on the main
+     * thread. `status.copy(...)` at the call site would be a non-atomic
+     * read-modify-write racing binder-thread GATT callbacks against
+     * main-thread advertise callbacks -- last writer wins with a stale read,
+     * e.g. reverting `advertising` right after a re-advertise succeeded.
+     */
+    private fun updateStatus(transform: (ConnectionStatus) -> ConnectionStatus) {
         mainHandler.post {
+            val newStatus = transform(status)
+            status = newStatus
             listener?.onStatusChanged(newStatus)
             // POST_NOTIFICATIONS is a runtime permission on API 33+; the
             // foreground service keeps running either way (that grant only

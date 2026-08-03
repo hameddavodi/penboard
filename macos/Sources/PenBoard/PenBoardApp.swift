@@ -147,6 +147,11 @@ final class PenBoardApp: NSObject, NSApplicationDelegate {
 
         switch requested {
         case .draw:
+            // Leaving Laser mid-drag: the PEN_UP that would balance the
+            // injected leftMouseDown will now be routed to the canvas, so
+            // release the button before handing the pipeline over — otherwise
+            // the system is left drag-selecting under every real mouse move.
+            cursorInjector.releaseIfDown()
             overlayWindow.orderFrontRegardless()
         case .laser:
             if previousMode == .draw {
@@ -219,8 +224,28 @@ final class PenBoardApp: NSObject, NSApplicationDelegate {
         statusMenu.updateDisplaySelection(id: chosen.id, isFallback: isFallback)
 
         let frameChanged = currentDisplay?.appKitFrame != chosen.appKitFrame
+        // Mirrored displays share an identical AppKit frame, so a switch
+        // between them changes the id (which capture and injection target)
+        // without changing the frame — diff both, not just the frame.
+        let idChanged = currentDisplay?.id != chosen.id
         currentDisplay = chosen
-        guard frameChanged else { return }
+
+        // The injector's CG frame depends on TWO inputs: the target's AppKit
+        // frame and the primary screen's height (CG's y-origin is derived from
+        // it). The primary's height can change while this target's frame
+        // doesn't (scaled-resolution change, clamshell transition), so the
+        // injector must be refreshed on every screen-parameters pass — even
+        // the ones the guard below treats as no-ops. Deferred so it runs
+        // after any retarget.
+        defer {
+            let primaryScreenHeight = NSScreen.screens.first?.frame.height ?? overlayWindow.displayFrame.height
+            cursorInjector.update(cgDisplayFrame: CoordinateMapper.cgFrame(
+                fromAppKitFrame: overlayWindow.displayFrame,
+                primaryScreenHeight: primaryScreenHeight
+            ))
+        }
+
+        guard frameChanged || idChanged else { return }
         guard let screen = NSScreen.screens.first(where: { Self.displayID(for: $0) == chosen.id }) else {
             log.error("Resolved display id \(chosen.id, privacy: .public) not found among current NSScreen.screens")
             return
@@ -229,11 +254,6 @@ final class PenBoardApp: NSObject, NSApplicationDelegate {
         log.info("Retargeting overlay to display \(chosen.id, privacy: .public) (fallback: \(isFallback, privacy: .public))")
         overlayWindow.retarget(to: screen)
         canvasView.resize(to: overlayWindow.contentRect.size)
-        let primaryScreenHeight = NSScreen.screens.first?.frame.height ?? overlayWindow.displayFrame.height
-        cursorInjector.update(cgDisplayFrame: CoordinateMapper.cgFrame(
-            fromAppKitFrame: overlayWindow.displayFrame,
-            primaryScreenHeight: primaryScreenHeight
-        ))
         // D2: stroke geometry is stored in view-local points, so it can't
         // survive a frame change; clearAll() also syncs the tablet's mirror
         // via the existing CONTROL CLEAR opcode (PROTOCOL §5, zero protocol
@@ -292,6 +312,10 @@ extension PenBoardApp: CentralPacketDelegate {
         // force-close so the next surviving PEN_MOVE doesn't get appended to a
         // stroke the tablet already considers finished. No-op if nothing is open.
         canvasView.forceCloseOpenStroke()
+        // Same lost-PEN_UP hazard in Laser mode, with worse fallout: an
+        // unbalanced leftMouseDown leaves the real mouse button logically held
+        // system-wide. No-op if the pen isn't down.
+        cursorInjector.releaseIfDown()
     }
 }
 

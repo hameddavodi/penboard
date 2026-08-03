@@ -78,6 +78,14 @@ final class CanvasView: NSView {
                 continue // PROTOCOL §4: hover is ignored in Draw mode.
 
             case .penDown:
+                // PROTOCOL §4: "strokes self-heal on the next PEN_DOWN". If the
+                // previous stroke's PEN_UP was lost and a new PEN_DOWN arrives
+                // inside the 500 ms stall window, close it now — otherwise it
+                // stays open at a non-last index forever, where undo()
+                // (lastIndex of closed), the stall reaper (openStroke = last),
+                // and bakeNewlyClosedStrokes (open stroke assumed last) all
+                // miss it.
+                strokeStore.closeOpenStroke()
                 if point.barrelButtonHeld {
                     isErasing = true
                     eraseIfHit(at: mapped)

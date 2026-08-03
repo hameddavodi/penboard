@@ -47,6 +47,22 @@ class MjpegClient(private val listener: Listener) {
     @Volatile private var currentEndpoint: Endpoint? = null
     private var worker: Thread? = null
 
+    /**
+     * Per-worker liveness token. `Thread.interrupt()` does NOT unblock a
+     * `Socket` read, so a stopped worker can sit inside `input.read` for up
+     * to the read timeout -- and with only the shared `enabled` flag, a
+     * stop+start inside that window revived the OLD worker alongside the new
+     * one (two threads dialing the Mac, kicking each other's connection off
+     * forever). Each worker captures its generation; `stop()` bumps it, so a
+     * revived `enabled` can never resurrect a stale worker. start/stop are
+     * main-thread-only (MainActivity + discovery's main executor), so the
+     * increment needs no atomicity.
+     */
+    @Volatile private var generation = 0
+
+    /** The socket of the live worker, closed by [stop] to unblock a read in progress. */
+    @Volatile private var activeSocket: Socket? = null
+
     /** Coalescing hand-off to the main thread: only the newest decoded bitmap is ever delivered (C4), never a growing queue. */
     private val framePosted = AtomicBoolean(false)
     @Volatile private var latestBitmap: Bitmap? = null
@@ -56,7 +72,8 @@ class MjpegClient(private val listener: Listener) {
         currentEndpoint = Endpoint(host, port, token)
         if (enabled) return
         enabled = true
-        val thread = Thread({ runLoop() }, "MjpegClient")
+        val gen = generation
+        val thread = Thread({ runLoop(gen) }, "MjpegClient")
         thread.isDaemon = true
         worker = thread
         thread.start()
@@ -66,24 +83,29 @@ class MjpegClient(private val listener: Listener) {
     fun stop() {
         if (!enabled) return
         enabled = false
+        generation++ // invalidate the current worker even if enabled flips true again
         currentEndpoint = null
-        worker?.interrupt()
+        runCatching { activeSocket?.close() } // unblocks a read in progress; interrupt() can't
+        activeSocket = null
+        worker?.interrupt() // unblocks the backoff sleep
         worker = null
     }
 
-    private fun runLoop() {
+    private fun isLive(gen: Int): Boolean = enabled && gen == generation
+
+    private fun runLoop(gen: Int) {
         var backoffMs = INITIAL_BACKOFF_MS
-        while (enabled) {
+        while (isLive(gen)) {
             val endpoint = currentEndpoint ?: break
-            postState(State.CONNECTING)
-            val everStreamed = runSingleConnection(endpoint)
-            if (!enabled) break
+            postState(gen, State.CONNECTING)
+            val everStreamed = runSingleConnection(endpoint, gen)
+            if (!isLive(gen)) break
             // A connection that streamed at least one frame before dropping
             // is more likely a transient blip than a dead endpoint -- retry
             // fast for that case and only back off on outright connect/reject
             // failures (mirrors PenBoardService's reconnectBackoffMs pattern).
             backoffMs = if (everStreamed) INITIAL_BACKOFF_MS else (backoffMs * 2).coerceAtMost(MAX_BACKOFF_MS)
-            postState(State.WAITING)
+            postState(gen, State.WAITING)
             try {
                 Thread.sleep(backoffMs)
             } catch (_: InterruptedException) {
@@ -92,11 +114,12 @@ class MjpegClient(private val listener: Listener) {
         }
     }
 
-    private fun runSingleConnection(endpoint: Endpoint): Boolean {
+    private fun runSingleConnection(endpoint: Endpoint, gen: Int): Boolean {
         var everStreamed = false
         var socket: Socket? = null
         try {
             socket = Socket()
+            if (isLive(gen)) activeSocket = socket
             socket.soTimeout = READ_TIMEOUT_MS
             socket.connect(InetSocketAddress(endpoint.host, endpoint.port), CONNECT_TIMEOUT_MS)
 
@@ -110,11 +133,11 @@ class MjpegClient(private val listener: Listener) {
                 Log.w(TAG, "stream request rejected (bad status line)")
                 return false
             }
-            postState(State.STREAMING)
+            postState(gen, State.STREAMING)
 
             val parser = MjpegParser { frame -> handleFrame(frame) }
             val chunk = ByteArray(READ_CHUNK_BYTES)
-            while (enabled) {
+            while (isLive(gen)) {
                 val n = input.read(chunk)
                 if (n == -1) break // EOF -- Mac closed (toggle off, or another client replaced us, C3)
                 everStreamed = true
@@ -122,6 +145,13 @@ class MjpegClient(private val listener: Listener) {
             }
         } catch (e: IOException) {
             Log.w(TAG, "stream connection failed: ${e.message}")
+        } catch (e: Exception) {
+            // A non-IO failure (e.g. a decode/listener bug) must not kill the
+            // worker with `enabled` still true -- that wedged the client
+            // permanently: start() early-returns on `enabled`, so no
+            // discovery event could ever revive it. Log and fall into the
+            // normal backoff/retry path instead.
+            Log.e(TAG, "unexpected stream failure", e)
         } finally {
             runCatching { socket?.close() }
         }
@@ -156,7 +186,8 @@ class MjpegClient(private val listener: Listener) {
         }
     }
 
-    private fun postState(state: State) {
+    private fun postState(gen: Int, state: State) {
+        if (!isLive(gen)) return // a superseded worker must not fight the live one over UI state
         mainHandler.post { listener.onStateChanged(state) }
     }
 

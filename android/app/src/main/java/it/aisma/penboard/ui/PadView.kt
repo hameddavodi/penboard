@@ -32,6 +32,16 @@ constructor(context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
     /** Invoked for every point extracted from a stylus/eraser MotionEvent, in order. */
     var onPoint: ((PenPoint) -> Unit)? = null
 
+    /**
+     * Invoked when a size change (rotation -- the manifest opts out of activity
+     * recreation via configChanges) forced the local ink to be dropped: stroke
+     * samples are stored in absolute view pixels, so old geometry is meaningless
+     * in the new layout. MainActivity uses this to send CLEAR to the Mac,
+     * keeping the two mirrors in sync (the Mac clears on its own display
+     * changes the same way).
+     */
+    var onInkInvalidated: (() -> Unit)? = null
+
     private var activeRect = PadCoordinateMapper.ActiveRect(0f, 0f, 1f, 1f)
     private val strokes = ArrayList<InkStroke>()
     private var currentStroke: InkStroke? = null
@@ -105,6 +115,16 @@ constructor(context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
             cacheBitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
             cacheCanvas = Canvas(cacheBitmap!!)
             bakedStrokeCount = 0
+            // Stroke samples live in absolute view pixels (see pixelX/pixelY),
+            // so a real size change (rotation) invalidates every stroke's
+            // geometry -- re-baking them unchanged would paint displaced ink,
+            // including on top of the letterbox bars. Mirrors the Mac's
+            // CanvasView.resize(), which clears for exactly this reason.
+            if ((oldw > 0 || oldh > 0) && (strokes.isNotEmpty() || currentStroke != null)) {
+                strokes.clear()
+                currentStroke = null
+                onInkInvalidated?.invoke()
+            }
         }
     }
 
@@ -246,16 +266,36 @@ constructor(context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
 /**
  * Adapts a real [MotionEvent] to [StylusEventSample] so the pure
  * [StylusPointExtractor] logic runs identically here and in plain-JVM tests.
- * Always reads pointer index 0 -- per the fetched Android docs
- * (internal docs), filtering pointer
- * 0's tool type is sufficient palm rejection for a single S Pen.
+ *
+ * The stylus is NOT always pointer index 0: when a palm/finger lands before
+ * the pen, the pen arrives at a higher index, and when the stylus lifts while
+ * another pointer is still down its lift is ACTION_POINTER_UP rather than
+ * ACTION_UP. This adapter (a) locates the stylus/eraser pointer by tool type
+ * and reads all coordinates from that index, and (b) translates
+ * ACTION_POINTER_DOWN/UP *of the stylus pointer* into plain DOWN/UP so the
+ * extractor emits the PEN_DOWN/PEN_UP the protocol requires. Multi-pointer
+ * transitions of non-stylus pointers keep their raw action, which the
+ * extractor ignores -- that remains the palm-rejection path.
  */
 private class AndroidStylusEventSample(private val event: MotionEvent) : StylusEventSample {
+    private val pointerIndex: Int =
+        (0 until event.pointerCount).firstOrNull {
+            event.getToolType(it) == MotionEvent.TOOL_TYPE_STYLUS ||
+                event.getToolType(it) == MotionEvent.TOOL_TYPE_ERASER
+        } ?: 0
+
     override val toolType: Int
-        get() = event.getToolType(0)
+        get() = event.getToolType(pointerIndex)
 
     override val actionMasked: Int
-        get() = event.actionMasked
+        get() =
+            when (event.actionMasked) {
+                MotionEvent.ACTION_POINTER_DOWN ->
+                    if (event.actionIndex == pointerIndex) MotionEvent.ACTION_DOWN else event.actionMasked
+                MotionEvent.ACTION_POINTER_UP ->
+                    if (event.actionIndex == pointerIndex) MotionEvent.ACTION_UP else event.actionMasked
+                else -> event.actionMasked
+            }
 
     override val buttonState: Int
         get() = event.buttonState
@@ -264,17 +304,17 @@ private class AndroidStylusEventSample(private val event: MotionEvent) : StylusE
         get() = event.historySize
 
     override val x: Float
-        get() = event.getX(0)
+        get() = event.getX(pointerIndex)
 
     override val y: Float
-        get() = event.getY(0)
+        get() = event.getY(pointerIndex)
 
     override val pressure: Float
-        get() = event.getPressure(0)
+        get() = event.getPressure(pointerIndex)
 
-    override fun historicalX(pos: Int): Float = event.getHistoricalX(0, pos)
+    override fun historicalX(pos: Int): Float = event.getHistoricalX(pointerIndex, pos)
 
-    override fun historicalY(pos: Int): Float = event.getHistoricalY(0, pos)
+    override fun historicalY(pos: Int): Float = event.getHistoricalY(pointerIndex, pos)
 
-    override fun historicalPressure(pos: Int): Float = event.getHistoricalPressure(0, pos)
+    override fun historicalPressure(pos: Int): Float = event.getHistoricalPressure(pointerIndex, pos)
 }
