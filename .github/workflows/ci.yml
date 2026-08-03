@@ -25,7 +25,9 @@ jobs:
         run: ./gradlew :app:assembleDebug :app:testDebugUnitTest lint ktfmtCheck
 
   macos:
-    runs-on: macos-15
+    # Package.swift requires Swift tools 6.2; macos-15's default Xcode ships
+    # Swift 6.1.
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
       - name: Build

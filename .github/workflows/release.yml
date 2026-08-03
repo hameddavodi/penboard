@@ -43,7 +43,9 @@ jobs:
           if-no-files-found: error
 
   app:
-    runs-on: macos-15
+    # Package.swift requires Swift tools 6.2; macos-15's default Xcode ships
+    # Swift 6.1 (this is what broke the July CI runs too).
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
       - name: Build and assemble app bundle
