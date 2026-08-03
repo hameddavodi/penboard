@@ -35,6 +35,16 @@ docs/      PROTOCOL.md (wire contract) · ADRs
 
 ### macOS (central)
 
+- `Stream/` (v1.1) — optional Mac→tablet screen streaming: `ScreenStreamer`
+  captures the selected display via ScreenCaptureKit (~12 fps, JPEG),
+  `MJPEGServer` serves it as MJPEG-over-HTTP on an ephemeral TCP port
+  advertised via Bonjour (`_penboard-stream._tcp`) with a per-toggle random
+  token in the TXT record; the tablet's `stream/` package (NsdManager
+  discovery + raw-socket client + incremental MJPEG parser) renders it under
+  the pad. Always off at launch, never persisted; requires the Screen
+  Recording permission.
+
+
 - `BLE/Central` — CoreBluetooth state machine: scan by service UUID → connect →
   handshake → subscribe → stream. Reconnects by CoreBluetooth peripheral
   identifier (never MAC address — Android rotates private addresses) with
@@ -75,8 +85,18 @@ treats it as one:
 3. Every inbound packet is schema-validated; malformed packets are counted and
    a flood (>10/60 s) disconnects and disables auto-reconnect.
 4. Clicks are rate-limited (≤20/s) and cursor positions clamped to the display.
-5. No network listeners anywhere; Bluetooth only. Packet contents are never
-   logged.
+5. The pen/control path is Bluetooth-only with no network listeners; packet
+   contents are never logged.
+6. Screen streaming (v1.1, opt-in per session) is the exception: it opens a
+   TCP listener on all interfaces while enabled. Access control is a random
+   128-bit token minted per toggle-ON — but note the token is published in
+   the Bonjour TXT record, i.e. readable by every device on the LAN, and the
+   stream is plain HTTP (no TLS) with no binding to the BLE-trusted peer.
+   Against a hostile local network this protects nothing: treat the v1.1
+   stream as trusted-LAN-only. (Deriving a shared secret over the
+   BLE-encrypted CONTROL channel instead is the known fix; it requires a
+   protocol version bump and is deliberately out of scope for v1.1.) Idle
+   connections that never present the token are dropped after 5 s.
 
 ## Testing
 

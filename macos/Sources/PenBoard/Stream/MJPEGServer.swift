@@ -29,6 +29,12 @@ final class MJPEGServer: NSObject, @unchecked Sendable {
     /// C3: the server holds exactly one streaming client; a new connection
     /// presenting a valid token replaces (closes) the old one.
     private var client: NWConnection?
+    /// Accepted connections that haven't presented a request yet. Tracked so
+    /// teardown can reach them and so a peer that connects and sends nothing
+    /// (port scanner, Slowloris) is cancelled after a timeout instead of
+    /// being kept alive forever by its pending receive callback.
+    private var pendingConnections: [NWConnection] = []
+    private static let requestTimeoutSeconds: TimeInterval = 5
     /// C4 backpressure: skip a push if the previous one hasn't completed —
     /// only the latest frame is ever queued for a slow client, never a
     /// growing buffer.
@@ -126,16 +132,43 @@ final class MJPEGServer: NSObject, @unchecked Sendable {
         client?.cancel()
         client = nil
         isSending = false
+        for pending in pendingConnections { pending.cancel() }
+        pendingConnections.removeAll()
         listener?.cancel()
         listener = nil
+    }
+
+    private func removePending(_ connection: NWConnection) {
+        pendingConnections.removeAll { $0 === connection }
     }
 
     // MARK: New connections (C3)
 
     private func handleNewConnection(_ connection: NWConnection) {
+        pendingConnections.append(connection)
+        connection.stateUpdateHandler = { [weak self, weak connection] state in
+            guard let self, let connection else { return }
+            if case .failed = state { connection.cancel() }
+            switch state {
+            case .failed, .cancelled:
+                self.removePending(connection)
+            default:
+                break
+            }
+        }
         connection.start(queue: queue)
+        // A peer that connects and never sends a request would otherwise be
+        // held alive forever by the pending receive below.
+        queue.asyncAfter(deadline: .now() + Self.requestTimeoutSeconds) { [weak self, weak connection] in
+            guard let self, let connection else { return }
+            if self.pendingConnections.contains(where: { $0 === connection }) {
+                self.log.info("Dropping connection that sent no request within timeout")
+                connection.cancel()
+            }
+        }
         connection.receive(minimumIncompleteLength: 1, maximumLength: Self.requestReadCap) { [weak self] data, _, _, error in
             guard let self else { return }
+            self.removePending(connection)
             guard
                 error == nil, let data, let path = MJPEGWire.requestPath(from: data),
                 let token = self.token, MJPEGWire.pathMatches(path: path, token: token)
@@ -155,6 +188,26 @@ final class MJPEGServer: NSObject, @unchecked Sendable {
         client?.cancel()
         isSending = false
         client = connection
+        // Watch the adopted client's state: a dead client (tablet slept, left
+        // Wi-Fi, or closed) must release its socket and clear the slot —
+        // Network.framework only frees a connection on explicit cancel, and
+        // nothing else ever clears `client` until the next adopt/teardown.
+        connection.stateUpdateHandler = { [weak self, weak connection] state in
+            guard let self, let connection else { return }
+            switch state {
+            case .failed:
+                connection.cancel()
+                fallthrough
+            case .cancelled:
+                if self.client === connection {
+                    self.log.info("Streaming client disconnected")
+                    self.client = nil
+                    self.isSending = false
+                }
+            default:
+                break
+            }
+        }
         connection.send(
             content: MJPEGWire.responseHeader(),
             completion: .contentProcessed { [weak self] error in

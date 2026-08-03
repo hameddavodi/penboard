@@ -78,9 +78,19 @@ class PenGattServer(private val callback: Callback) {
     @Volatile private var notificationInFlight = false
     @Volatile private var lastPingReceivedAt = SystemClock.elapsedRealtime()
 
+    /// False until the first PING of the current session. Before that the §6
+    /// sequence is still in flight and is human-paced on the Mac side (SMP
+    /// pairing dialog + trust confirmation), so the watchdog allows the longer
+    /// handshake grace instead of the 10 s steady-state PING timeout.
+    @Volatile private var pingSeenThisSession = false
+
     private val controlOutbox = ArrayDeque<ByteArray>()
     private val malformedTimestamps = ArrayDeque<Long>()
-    private var notifyQueue = buildNotifyQueue()
+
+    // @Volatile: reassigned on every (re)connect from a binder thread while the
+    // UI/input thread reads it in enqueuePoint -- without it the pad can keep
+    // feeding the previous session's queue (stale seq, silently lost points).
+    @Volatile private var notifyQueue = buildNotifyQueue()
 
     // PROTOCOL §6.9: tablet drops the "connected" UI state if no PING for
     // 10s. Without an active check, a zombie link (BLE stack still thinks
@@ -118,11 +128,27 @@ class PenGattServer(private val callback: Callback) {
                 }
                 when (newState) {
                     BluetoothProfile.STATE_CONNECTED -> {
+                        // Some stacks report STATE_CONNECTED with an error
+                        // status (e.g. failed encryption re-establishment);
+                        // adopting that as a live session flips the UI to
+                        // "connected" for a link that never came up.
+                        if (status != BluetoothGatt.GATT_SUCCESS) {
+                            Log.w(TAG, "ignoring STATE_CONNECTED with error status $status")
+                            return
+                        }
                         connectedDevice = device
                         resetSessionState()
                         callback.onConnectionStateChanged(deviceDisplayName(device))
                     }
                     BluetoothProfile.STATE_DISCONNECTED -> {
+                        // Only the active central's disconnect ends the
+                        // session. Without this check, the DISCONNECTED event
+                        // for a *refused* second central (cancelConnection
+                        // above) nulls connectedDevice out from under the
+                        // still-connected Mac: ink stops, the keepalive
+                        // watchdog disarms, and the service re-advertises
+                        // over a live link.
+                        if (device != connectedDevice) return
                         connectedDevice = null
                         callback.onConnectionStateChanged(null)
                     }
@@ -143,6 +169,7 @@ class PenGattServer(private val callback: Callback) {
             ) {
                 val server = gattServer ?: return
                 if (characteristic.uuid == INFO_CHARACTERISTIC_UUID) {
+                    lastPingReceivedAt = SystemClock.elapsedRealtime() // setup progress counts as liveness
                     server.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, infoPayload)
                 } else {
                     server.sendResponse(device, requestId, BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED, offset, null)
@@ -188,6 +215,7 @@ class PenGattServer(private val callback: Callback) {
                     STREAM_CHARACTERISTIC_UUID -> streamSubscribed = enable
                     CONTROL_CHARACTERISTIC_UUID -> controlSubscribed = enable
                 }
+                lastPingReceivedAt = SystemClock.elapsedRealtime() // setup progress counts as liveness
                 if (responseNeeded) {
                     gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, null)
                 }
@@ -242,7 +270,13 @@ class PenGattServer(private val callback: Callback) {
     private fun checkKeepalive() {
         val device = connectedDevice ?: return
         val elapsed = SystemClock.elapsedRealtime() - lastPingReceivedAt
-        if (elapsed > PING_TIMEOUT_MS) {
+        // The Mac sends its first PING only after the entire §6 sequence
+        // completes -- which on a first connect includes the user answering
+        // the macOS pairing dialog AND the trust-confirmation dialog. Killing
+        // the link 10 s in guarantees first-time pairing loops forever, so the
+        // strict timeout only applies once PINGs have actually started.
+        val timeout = if (pingSeenThisSession) PING_TIMEOUT_MS else HANDSHAKE_GRACE_MS
+        if (elapsed > timeout) {
             Log.w(TAG, "no PING received for ${elapsed}ms, treating link as dead")
             gattServer?.cancelConnection(device) // triggers onConnectionStateChange(STATE_DISCONNECTED) -> existing reconnect/re-advertise path
         }
@@ -303,6 +337,12 @@ class PenGattServer(private val callback: Callback) {
             BluetoothGattDescriptor.PERMISSION_READ_ENCRYPTED or BluetoothGattDescriptor.PERMISSION_WRITE_ENCRYPTED,
         )
 
+    // @Synchronized: called from the binder-thread onConnectionStateChange
+    // while sendControl/pumpControlOutbox (other binder threads) mutate
+    // controlOutbox under the same monitor. Lock order stays one-directional
+    // (this method never calls into NotifyQueue's monitor -- buildNotifyQueue
+    // only constructs).
+    @Synchronized
     private fun resetSessionState() {
         currentMtu = DEFAULT_MTU
         streamSubscribed = false
@@ -310,6 +350,7 @@ class PenGattServer(private val callback: Callback) {
         streamGateOpen = false
         notificationInFlight = false
         lastPingReceivedAt = SystemClock.elapsedRealtime()
+        pingSeenThisSession = false
         controlOutbox.clear()
         malformedTimestamps.clear()
         notifyQueue = buildNotifyQueue()
@@ -393,6 +434,10 @@ class PenGattServer(private val callback: Callback) {
 
     @SuppressLint("MissingPermission") // permission verified upstream by BlePermissions before start()
     private fun handleControlPacket(device: BluetoothDevice, packet: ControlPacket) {
+        // Any schema-valid CONTROL from the Mac proves the app-level link is
+        // alive -- it feeds the same watchdog as PING so setup traffic (HELLO,
+        // STATE_SYNC) counts as progress during the pre-PING handshake window.
+        lastPingReceivedAt = SystemClock.elapsedRealtime()
         when (packet.opcode) {
             ControlOpcode.HELLO -> {
                 val hello = packet.asHello()
@@ -418,7 +463,7 @@ class PenGattServer(private val callback: Callback) {
                 streamGateOpen = true
             }
             ControlOpcode.PING -> {
-                lastPingReceivedAt = SystemClock.elapsedRealtime()
+                pingSeenThisSession = true
                 sendControl(device, Packets.encodeControl(ControlOpcode.PONG, packet.payload))
             }
             ControlOpcode.SET_MODE -> callback.onSetMode(packet.payload[0].toInt() and 0xFF)
@@ -440,6 +485,9 @@ class PenGattServer(private val callback: Callback) {
         }
     }
 
+    // @Synchronized: GATT callbacks are not guaranteed to arrive on a single
+    // binder thread, and resetSessionState clears this deque concurrently.
+    @Synchronized
     private fun recordMalformedAndCheckFlood(): Boolean {
         val now = SystemClock.elapsedRealtime()
         malformedTimestamps.addLast(now)
@@ -476,6 +524,15 @@ class PenGattServer(private val callback: Callback) {
 
         /** PROTOCOL §6.9: tablet drops "connected" if no PING arrives for this long. */
         private const val PING_TIMEOUT_MS = 10_000L
+
+        /**
+         * Watchdog allowance before the first PING of a session: the §6
+         * sequence is human-paced on a first connect (macOS pairing dialog +
+         * trust confirmation), so the 10 s steady-state timeout only arms
+         * once PINGs start. Setup traffic (INFO read, CCCD writes, CONTROL)
+         * refreshes the clock within this window.
+         */
+        private const val HANDSHAKE_GRACE_MS = 90_000L
         private const val KEEPALIVE_CHECK_INTERVAL_MS = 2_000L
 
         val SERVICE_UUID: UUID = UUID.fromString("C5F1A9E2-7B34-4E86-9D12-8A50C3B7F6D4")

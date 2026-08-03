@@ -117,6 +117,9 @@ class MainActivity : AppCompatActivity(), PenBoardService.Listener {
         grantPermissionsButton.setOnClickListener { permissionLauncher.launch(permissionsToRequest()) }
 
         padView.onPoint = { point -> service?.enqueuePoint(point) }
+        // Rotation dropped the local ink (stroke pixels don't survive a size
+        // change) -- clear the Mac's mirror too so both sides stay in sync.
+        padView.onInkInvalidated = { service?.sendControl(ControlOpcode.CLEAR) }
         toolbar.listener = toolbarListener
 
         if (BlePermissions.allGranted(this)) {

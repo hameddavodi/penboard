@@ -38,6 +38,14 @@ final class ScreenStreamer: NSObject, @unchecked Sendable {
     /// ScreenCaptureKit's own drop-stale-frames mechanism.
     private var isEncoding = false
 
+    /// Confined to `queue`. Bumped by every teardown; the async capture-setup
+    /// task snapshots it and re-checks before arming the stream. Without this,
+    /// toggling OFF while `SCShareableContent` is still resolving (routinely
+    /// hundreds of ms) let the in-flight task start capture anyway — screen
+    /// recording live, purple indicator on, menu showing OFF — and two
+    /// overlapping `start()`s could orphan an unstoppable second SCStream.
+    private var captureGeneration = 0
+
     /// Always called on `queue`. C4: exactly one JPEG per delivered frame.
     var onFrame: ((Data) -> Void)?
     /// Always called on `queue`. Fires on any stream-ending error (including
@@ -46,23 +54,33 @@ final class ScreenStreamer: NSObject, @unchecked Sendable {
 
     /// C4/A3: begin (or, if already running, replace) capture of `displayID`.
     /// Safe to call repeatedly — always tears down any existing stream first.
+    /// Async (never blocks the caller on this queue — the synchronous JPEG
+    /// encode also runs here, so a `queue.sync` from the main actor was a
+    /// visible UI hitch).
     func start(displayID: CGDirectDisplayID) {
-        queue.sync { teardownLocked() }
-        Task { [weak self] in
+        queue.async { [weak self] in
             guard let self else { return }
-            do {
-                // async import of getExcludingDesktopWindows(_:onScreenWindowsOnly:completionHandler:).
-                let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-                guard let display = content.displays.first(where: { $0.displayID == displayID }) ?? content.displays.first
-                else {
-                    self.log.error("No capturable display found (requested id \(displayID, privacy: .public))")
-                    self.onStopped?(nil)
-                    return
+            self.teardownLocked()
+            let generation = self.captureGeneration
+            Task { [weak self] in
+                guard let self else { return }
+                do {
+                    // async import of getExcludingDesktopWindows(_:onScreenWindowsOnly:completionHandler:).
+                    let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+                    // No fallback to "some other display": silently streaming
+                    // the wrong screen to a remote tablet is a privacy failure,
+                    // not a graceful degradation.
+                    guard let display = content.displays.first(where: { $0.displayID == displayID })
+                    else {
+                        self.log.error("No capturable display found (requested id \(displayID, privacy: .public))")
+                        self.onStopped?(nil)
+                        return
+                    }
+                    self.beginCapture(on: display, generation: generation)
+                } catch {
+                    self.log.error("SCShareableContent fetch failed: \(String(describing: error), privacy: .public)")
+                    self.onStopped?(error)
                 }
-                self.beginCapture(on: display)
-            } catch {
-                self.log.error("SCShareableContent fetch failed: \(String(describing: error), privacy: .public)")
-                self.onStopped?(error)
             }
         }
     }
@@ -75,18 +93,19 @@ final class ScreenStreamer: NSObject, @unchecked Sendable {
     }
 
     func stop() {
-        queue.sync { teardownLocked() }
+        queue.async { [weak self] in self?.teardownLocked() }
     }
 
-    /// Must only run confined to `queue` (via `queue.sync` from the entry
+    /// Must only run confined to `queue` (via `queue.async` from the entry
     /// points above — capture setup itself happens off-queue since it's async).
     private func teardownLocked() {
+        captureGeneration += 1 // invalidate any in-flight capture-setup task
         stream?.stopCapture(completionHandler: nil)
         stream = nil
         isEncoding = false
     }
 
-    private func beginCapture(on display: SCDisplay) {
+    private func beginCapture(on display: SCDisplay, generation: Int) {
         let filter = SCContentFilter(display: display, excludingWindows: [])
         let config = SCStreamConfiguration()
         let size = Self.scaledSize(sourceWidth: display.width, sourceHeight: display.height)
@@ -105,11 +124,31 @@ final class ScreenStreamer: NSObject, @unchecked Sendable {
             onStopped?(error)
             return
         }
-        queue.sync { self.stream = newStream }
+        var stale = false
+        queue.sync {
+            if generation == self.captureGeneration {
+                self.stream = newStream
+            } else {
+                stale = true
+            }
+        }
+        // A teardown ran while this setup task was resolving content — the
+        // stream was never started, so simply abandoning it here is enough.
+        if stale { return }
         newStream.startCapture { [weak self] error in
+            guard let self else { return }
             if let error {
-                self?.log.error("startCapture failed: \(String(describing: error), privacy: .public)")
-                self?.onStopped?(error)
+                self.log.error("startCapture failed: \(String(describing: error), privacy: .public)")
+                self.onStopped?(error)
+                return
+            }
+            // A teardown could also land between the assignment above and
+            // capture actually starting; a capture that outlives its toggle
+            // must be stopped, not leaked.
+            self.queue.async {
+                if generation != self.captureGeneration {
+                    newStream.stopCapture(completionHandler: nil)
+                }
             }
         }
     }

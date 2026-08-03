@@ -25,6 +25,9 @@ final class CursorInjector {
     private var isDown = false
     private var smoothed: CGPoint?
     private var recentClickTimes: [Date] = []
+    /// Last position injected while down — where `releaseIfDown()` posts its
+    /// balancing `leftMouseUp` when the real PEN_UP never arrives.
+    private var lastDownPoint: CGPoint?
 
     /// PROTOCOL §8: click events rate-limited to 20/s.
     private let maxClicksPerSecond = 20
@@ -60,10 +63,15 @@ final class CursorInjector {
                 break // nothing to inject; the cursor simply stays put
 
             case .penDown:
+                // PROTOCOL §4 self-heal: a PEN_DOWN with the button still held
+                // means the previous PEN_UP was lost — balance it before
+                // posting a second leftMouseDown.
+                releaseIfDown()
                 smoothed = target // reset the smoothing anchor at contact
                 if canClick() {
                     post(.leftMouseDown, at: target)
                     isDown = true
+                    lastDownPoint = target
                 } else {
                     log.error("Click rate limit exceeded (>20/s) — dropping PEN_DOWN")
                 }
@@ -71,6 +79,7 @@ final class CursorInjector {
             case .penMove:
                 if isDown {
                     post(.leftMouseDragged, at: target)
+                    lastDownPoint = target
                 } else {
                     // Defensive fallback for a missed PEN_DOWN (PROTOCOL §4:
                     // strokes/gestures self-heal on the next down event).
@@ -81,10 +90,24 @@ final class CursorInjector {
                 if isDown {
                     post(.leftMouseUp, at: target)
                     isDown = false
+                    lastDownPoint = nil
                 }
                 smoothed = target
             }
         }
+    }
+
+    /// Balances an unmatched `leftMouseDown` when the PEN_UP that should have
+    /// ended it can no longer arrive: a STREAM seq gap dropped it, or the mode
+    /// switched away from Laser mid-drag. Without this the system is left with
+    /// the left button logically held — every real mouse movement becomes a
+    /// drag/rubber-band selection until the user clicks again.
+    func releaseIfDown() {
+        guard isDown else { return }
+        log.error("Releasing unmatched leftMouseDown (lost PEN_UP)")
+        post(.leftMouseUp, at: lastDownPoint ?? smoothed ?? CGPoint(x: cgDisplayFrame.midX, y: cgDisplayFrame.midY))
+        isDown = false
+        lastDownPoint = nil
     }
 
     private func canClick() -> Bool {

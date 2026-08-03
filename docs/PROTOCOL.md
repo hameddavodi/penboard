@@ -77,7 +77,7 @@ Per point (7 bytes):
 | Offset | Size | Field | Notes |
 |---|---|---|---|
 | +0 | u16 | x | normalized 0–65535, left → right |
-| +1 | u16 | y | normalized 0–65535, top → bottom |
+| +2 | u16 | y | normalized 0–65535, top → bottom |
 | +4 | u16 | pressure | 0–65535; 0 while hovering |
 | +6 | u8 | flags | see below |
 

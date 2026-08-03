@@ -100,6 +100,12 @@ final class Central: NSObject, @unchecked Sendable {
     private var reconnectAttempt = 0
     private var reconnectWorkItem: DispatchWorkItem?
     private var connectTimeoutTimer: DispatchSourceTimer?
+    private var setupTimeoutTimer: DispatchSourceTimer?
+
+    /// Monotonic per-connection-attempt counter. Bumped in `connect(to:)`, so a
+    /// callback captured during one attempt (e.g. the trust dialog completion)
+    /// can detect it no longer belongs to the live session and bail.
+    private var sessionGeneration = 0
 
     private var activityToken: NSObjectProtocol?
 
@@ -134,6 +140,19 @@ final class Central: NSObject, @unchecked Sendable {
     func userInitiatedConnect() {
         queue.async { [weak self] in
             guard let self else { return }
+            // Only meaningful when nothing is in flight: first-time connect,
+            // clearing the manual-reconnect gate, or skipping a backoff wait.
+            // From any live phase (connecting through connected) this would
+            // double-drive the connection — re-discovery, duplicate
+            // subscribes, and a second HELLO on an established link.
+            switch self.phase {
+            case .idle, .scanning, .backingOff, .waitingManualReconnect:
+                break
+            default:
+                self.log.info("Ignoring Connect click — an attempt/session is already in flight")
+                return
+            }
+            if case .scanning = self.phase { self.manager.stopScan() }
             self.floodGate.reset()
             self.reconnectAttempt = 0
             self.reconnectWorkItem?.cancel()
@@ -195,6 +214,7 @@ final class Central: NSObject, @unchecked Sendable {
     }
 
     private func connect(to peripheral: CBPeripheral) {
+        sessionGeneration += 1
         self.peripheral = peripheral
         peripheral.delegate = self
         phase = .connecting
@@ -238,6 +258,38 @@ final class Central: NSObject, @unchecked Sendable {
         manager.cancelPeripheralConnection(peripheral)
     }
 
+    /// Watchdog for the didConnect → connected window (service/characteristic
+    /// discovery, INFO read, subscribes, STATE_SYNC). The per-callback error
+    /// paths cancel a failed attempt, but a wedged peripheral can also simply
+    /// never call back at all — without a timer the machine parks in an
+    /// intermediate phase forever, showing "Pairing…" until relaunch. The
+    /// trust confirmation (.awaitingTrust) is user-paced, so the watchdog
+    /// re-arms rather than firing there; .handshaking additionally has its
+    /// own tighter 8 s HELLO_OK timer.
+    private static let setupTimeoutSeconds: TimeInterval = 20
+
+    private func armSetupTimeout() {
+        setupTimeoutTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + Self.setupTimeoutSeconds)
+        timer.setEventHandler { [weak self] in self?.handleSetupTimeout() }
+        setupTimeoutTimer = timer
+        timer.resume()
+    }
+
+    private func handleSetupTimeout() {
+        switch phase {
+        case .discoveringServices, .discoveringCharacteristics, .readingInfo,
+            .subscribingControl, .handshaking, .subscribingStream, .syncingState:
+            log.error("Session setup timed out in \(String(describing: self.phase), privacy: .public) — cancelling and retrying")
+            cancelConnection()
+        case .awaitingTrust:
+            armSetupTimeout()
+        default:
+            break
+        }
+    }
+
     private func scheduleReconnect() {
         peripheral = nil
         reconnectAttempt += 1
@@ -265,6 +317,8 @@ final class Central: NSObject, @unchecked Sendable {
         handshakeTimeoutTimer = nil
         connectTimeoutTimer?.cancel()
         connectTimeoutTimer = nil
+        setupTimeoutTimer?.cancel()
+        setupTimeoutTimer = nil
         lastStreamSeq = nil
         infoCharacteristic = nil
         controlCharacteristic = nil
@@ -360,10 +414,15 @@ final class Central: NSObject, @unchecked Sendable {
         } else {
             phase = .awaitingTrust
             let identifier = peripheral.identifier
+            // Bind this dialog to the session that spawned it: the modal can
+            // outlive the link (drop + auto-reconnect re-enters .awaitingTrust
+            // with a NEW code), and a confirm on the stale dialog must not
+            // unlock the newer session whose code the user never compared.
+            let generation = sessionGeneration
             Handshake.presentTrustDialog(deviceName: deviceName, token: token) { [weak self] confirmed in
                 guard let self else { return }
                 self.queue.async {
-                    guard case .awaitingTrust = self.phase else { return }
+                    guard case .awaitingTrust = self.phase, generation == self.sessionGeneration else { return }
                     if confirmed {
                         Handshake.markTrusted(identifier)
                         self.log.info("User confirmed trust")
@@ -398,6 +457,8 @@ final class Central: NSObject, @unchecked Sendable {
 
     private func onConnected() {
         reconnectAttempt = 0
+        setupTimeoutTimer?.cancel()
+        setupTimeoutTimer = nil
         activityToken = ProcessInfo.processInfo.beginActivity(
             options: .userInitiated,
             reason: "PenBoard BLE session active"
@@ -455,6 +516,10 @@ final class Central: NSObject, @unchecked Sendable {
     private func handleInfo(_ data: Data?) {
         guard let data, data.count >= 2 else {
             recordMalformed(reason: "INFO payload too short")
+            // Don't stay parked in .readingInfo — drop the link so the
+            // reconnect path retries (or the flood gate's manual-reconnect
+            // phase, if recordMalformed just tripped it, holds).
+            cancelConnection()
             return
         }
         let bytes = [UInt8](data)
@@ -473,6 +538,7 @@ final class Central: NSObject, @unchecked Sendable {
 
         guard let control = controlCharacteristic else {
             recordMalformed(reason: "CONTROL characteristic missing after INFO read")
+            cancelConnection()
             return
         }
         phase = .subscribingControl
@@ -606,7 +672,11 @@ extension Central: CBCentralManagerDelegate {
             teardownSession()
             reconnectWorkItem?.cancel()
             peripheral = nil
-            phase = .idle
+            // §8: the manual-reconnect gate (malformed flood / declined trust /
+            // version mismatch) must survive Bluetooth power cycles — otherwise
+            // a spontaneous bluetoothd bounce silently re-arms auto-reconnect
+            // to the very peer the gate was protecting against.
+            if phase != .waitingManualReconnect { phase = .idle }
         case .unauthorized:
             log.error("Bluetooth unauthorized (TCC)")
             phase = .idle
@@ -624,7 +694,8 @@ extension Central: CBCentralManagerDelegate {
             teardownSession()
             reconnectWorkItem?.cancel()
             peripheral = nil
-            phase = .idle
+            // Same §8 gate preservation as .poweredOff above.
+            if phase != .waitingManualReconnect { phase = .idle }
         case .unknown:
             log.info("Bluetooth state unknown")
         @unknown default:
@@ -645,14 +716,20 @@ extension Central: CBCentralManagerDelegate {
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        // Identity guard: a late callback for a peripheral this machine has
+        // already moved on from (cancelled attempt, replaced reference) must
+        // not drive the live session's state.
+        guard peripheral.identifier == self.peripheral?.identifier else { return }
         connectTimeoutTimer?.cancel()
         connectTimeoutTimer = nil
         log.info("Link-layer connected — discovering services")
         phase = .discoveringServices
+        armSetupTimeout()
         peripheral.discoverServices([Self.serviceUUID])
     }
 
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: (any Error)?) {
+        guard peripheral.identifier == self.peripheral?.identifier else { return }
         connectTimeoutTimer?.cancel()
         connectTimeoutTimer = nil
         log.error("Failed to connect: \(String(describing: error), privacy: .public)")
@@ -664,6 +741,10 @@ extension Central: CBCentralManagerDelegate {
         didDisconnectPeripheral peripheral: CBPeripheral,
         error: (any Error)?
     ) {
+        // Identity guard: a stale disconnect (for a connection already
+        // cancelled and superseded) must not tear down the active session's
+        // timers or flip it into backoff while the real link is healthy.
+        guard peripheral.identifier == self.peripheral?.identifier else { return }
         log.info("Disconnected: \(String(describing: error), privacy: .public)")
         teardownSession()
         if case .waitingManualReconnect = phase {
@@ -716,6 +797,15 @@ extension Central: CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: (any Error)?) {
         guard error == nil else {
             log.error("Read/notify error: \(String(describing: error), privacy: .public)")
+            // During session setup this error is fatal to the attempt — most
+            // importantly the encrypted INFO read that triggers SMP pairing:
+            // declining the macOS pairing dialog surfaces here as an
+            // insufficient-encryption error, and without this the machine
+            // parks in .readingInfo forever (no watchdog covers the
+            // discovery→subscribe window). Drop the link and let the
+            // reconnect path retry. Once connected, notify errors are
+            // transient — the PING keepalive owns liveness then.
+            if phase != .connected { cancelConnection() }
             return
         }
         switch characteristic.uuid {

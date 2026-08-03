@@ -152,7 +152,7 @@ enum ControlOpcode: UInt8 {
     case error = 0x0A
     case stateSync = 0x0B
 
-    /// Fixed payload length for this opcode per §5. `nil` means length 0.
+    /// Fixed payload length for this opcode per §5.
     var payloadLength: Int {
         switch self {
         case .setMode, .setColor, .setWidth, .helloOk, .error: return 1

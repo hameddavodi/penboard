@@ -43,9 +43,17 @@ final class StreamController {
                 self?.handleCaptureStopped(error)
             }
         }
+        // A listener failure (bind refused, Local Network permission denied,
+        // Bonjour registration rejected) means no client can ever connect —
+        // leaving `isEnabled` true would keep ScreenCaptureKit capturing at
+        // 12 fps forever with no consumer and the menu claiming ON. Tear down
+        // exactly like a capture failure.
         server.onFailure = { [weak self] error in
             Task { @MainActor in
-                self?.log.error("MJPEG server failure: \(String(describing: error), privacy: .public)")
+                guard let self else { return }
+                self.log.error("MJPEG server failure: \(String(describing: error), privacy: .public)")
+                guard self.isEnabled else { return }
+                self.stop()
             }
         }
     }
