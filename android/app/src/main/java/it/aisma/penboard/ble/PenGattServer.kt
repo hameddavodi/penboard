@@ -30,6 +30,7 @@ import it.aisma.penboard.proto.PenPoint
 import it.aisma.penboard.proto.asHello
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * GATT server for the PenBoard service (PROTOCOL §1): STREAM (notify-only,
@@ -68,6 +69,7 @@ class PenGattServer(private val callback: Callback) {
     }
 
     private var gattServer: BluetoothGattServer? = null
+    private var le2mPhySupported = false
     private var streamCharacteristic: BluetoothGattCharacteristic? = null
     private var controlCharacteristic: BluetoothGattCharacteristic? = null
 
@@ -87,6 +89,9 @@ class PenGattServer(private val callback: Callback) {
 
     private val controlOutbox = ArrayDeque<ByteArray>()
     private val sendRetryScheduled = AtomicBoolean(false)
+
+    /** Consecutive rejected notifies; backs the retry delay off so a stack that stays busy can't spin main at 50 Hz. */
+    private val sendRetryAttempts = AtomicInteger(0)
     private val malformedTimestamps = ArrayDeque<Long>()
 
     // @Volatile: reassigned on every (re)connect from a binder thread while the
@@ -140,6 +145,7 @@ class PenGattServer(private val callback: Callback) {
                         }
                         connectedDevice = device
                         resetSessionState()
+                        requestLe2mPhy(device)
                         callback.onConnectionStateChanged(deviceDisplayName(device))
                     }
                     BluetoothProfile.STATE_DISCONNECTED -> {
@@ -164,6 +170,10 @@ class PenGattServer(private val callback: Callback) {
                 if (device != connectedDevice) return
                 currentMtu = mtu
                 Log.i(TAG, "ATT MTU negotiated: $mtu")
+            }
+
+            override fun onPhyUpdate(device: BluetoothDevice, txPhy: Int, rxPhy: Int, status: Int) {
+                if (device == connectedDevice) Log.i(TAG, "PHY update: tx=$txPhy rx=$rxPhy status=$status")
             }
 
             @SuppressLint("MissingPermission") // permission verified upstream by BlePermissions before start()
@@ -264,6 +274,7 @@ class PenGattServer(private val callback: Callback) {
     fun start(context: Context, bluetoothManager: BluetoothManager): Boolean {
         val server = bluetoothManager.openGattServer(context, serverCallback) ?: return false
         gattServer = server
+        le2mPhySupported = bluetoothManager.adapter?.isLe2MPhySupported == true
         val service = buildService()
         streamCharacteristic = service.getCharacteristic(STREAM_CHARACTERISTIC_UUID)
         controlCharacteristic = service.getCharacteristic(CONTROL_CHARACTERISTIC_UUID)
@@ -276,6 +287,7 @@ class PenGattServer(private val callback: Callback) {
     fun stop() {
         keepaliveHandler.removeCallbacks(keepaliveCheck)
         keepaliveHandler.removeCallbacks(sendRetry)
+        sendRetryScheduled.set(false)
         gattServer?.close()
         gattServer = null
         connectedDevice = null
@@ -378,6 +390,7 @@ class PenGattServer(private val callback: Callback) {
         lastPingReceivedAt = SystemClock.elapsedRealtime()
         pingSeenThisSession = false
         controlOutbox.clear()
+        sendRetryAttempts.set(0)
         malformedTimestamps.clear()
         notifyQueue = buildNotifyQueue()
     }
@@ -401,6 +414,7 @@ class PenGattServer(private val callback: Callback) {
             scheduleSendRetry()
             return false
         }
+        sendRetryAttempts.set(0)
         notificationInFlight = true
         return true
     }
@@ -418,6 +432,7 @@ class PenGattServer(private val callback: Callback) {
         val next = controlOutbox.first()
         if (notify(device, characteristic, next)) {
             controlOutbox.removeFirst()
+            sendRetryAttempts.set(0)
             notificationInFlight = true
         } else {
             scheduleSendRetry()
@@ -431,10 +446,31 @@ class PenGattServer(private val callback: Callback) {
      * Without a retry, a rejected HELLO_OK stalled the handshake until the
      * 90 s watchdog, a rejected PONG cost the link, and a rejected PEN_UP sat
      * buffered until the next pen event. Coalesced: at most one pending retry.
+     * Backs off 20 -> 320 ms while rejections persist (reset on any accepted
+     * notify), so a zombie link inside the 90 s handshake grace doesn't burn
+     * a 50 Hz main-thread loop.
      */
     private fun scheduleSendRetry() {
         if (!sendRetryScheduled.compareAndSet(false, true)) return
-        keepaliveHandler.postDelayed(sendRetry, SEND_RETRY_DELAY_MS)
+        val shift = sendRetryAttempts.getAndIncrement().coerceAtMost(SEND_RETRY_MAX_BACKOFF_SHIFT)
+        keepaliveHandler.postDelayed(sendRetry, SEND_RETRY_DELAY_MS shl shift)
+    }
+
+    /**
+     * Asks for LE 2M PHY on the new link: half the airtime per notification,
+     * so each STREAM batch (and its onNotificationSent) completes sooner at
+     * lower radio power. Only a preference -- the controller negotiates with
+     * the Mac and silently stays on 1M if either side declines.
+     */
+    @SuppressLint("MissingPermission") // permission verified upstream by BlePermissions before start()
+    private fun requestLe2mPhy(device: BluetoothDevice) {
+        if (!le2mPhySupported) return
+        gattServer?.setPreferredPhy(
+            device,
+            BluetoothDevice.PHY_LE_2M_MASK,
+            BluetoothDevice.PHY_LE_2M_MASK,
+            BluetoothDevice.PHY_OPTION_NO_PREFERRED,
+        )
     }
 
     private fun handleNotificationSent(device: BluetoothDevice) {
@@ -588,6 +624,7 @@ class PenGattServer(private val callback: Callback) {
         private const val HANDSHAKE_GRACE_MS = 90_000L
         private const val KEEPALIVE_CHECK_INTERVAL_MS = 2_000L
         private const val SEND_RETRY_DELAY_MS = 20L
+        private const val SEND_RETRY_MAX_BACKOFF_SHIFT = 4
 
         val SERVICE_UUID: UUID = UUID.fromString("C5F1A9E2-7B34-4E86-9D12-8A50C3B7F6D4")
         val STREAM_CHARACTERISTIC_UUID: UUID = UUID.fromString("C5F1A9E3-7B34-4E86-9D12-8A50C3B7F6D4")

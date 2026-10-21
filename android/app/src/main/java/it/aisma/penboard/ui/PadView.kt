@@ -131,6 +131,13 @@ constructor(context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
     override fun onTouchEvent(event: MotionEvent): Boolean {
         val points = StylusPointExtractor.extract(AndroidStylusEventSample(event), activeRect)
         if (points.isEmpty()) return false
+        if (points[0].event == PointEvent.PEN_DOWN) {
+            // Until this stroke's UP, have input deliver each stylus sample as
+            // it arrives instead of batching to vsync: up to a frame less
+            // latency on the BLE path to the Mac (the local ink still draws
+            // once per frame, the extra events are cheap to handle).
+            requestUnbufferedDispatch(event)
+        }
         points.forEach(::handlePoint)
         if (points.any { it.event == PointEvent.PEN_UP }) {
             performClick() // accessibility contract for onTouchEvent overrides; no-op without a click listener
@@ -174,10 +181,12 @@ constructor(context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
             }
             PointEvent.PEN_MOVE -> {
                 if (currentGestureIsErase) {
+                    // eraseAt invalidates only when a stroke is actually
+                    // removed; an erase drag over empty pad needs no redraw.
                     eraseAt(point)
-                } else {
-                    currentStroke?.addSample(pixelX(point), pixelY(point), sampleWidthPx(point))
+                    return
                 }
+                currentStroke?.addSample(pixelX(point), pixelY(point), sampleWidthPx(point))
             }
             PointEvent.PEN_UP -> {
                 if (currentGestureIsErase) {

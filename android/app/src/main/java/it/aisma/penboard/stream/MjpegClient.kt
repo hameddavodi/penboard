@@ -5,6 +5,7 @@ import android.graphics.BitmapFactory
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import android.view.Choreographer
 import java.io.IOException
 import java.io.InputStream
 import java.net.InetSocketAddress
@@ -36,9 +37,9 @@ class MjpegClient(private val listener: Listener) {
 
     interface Listener {
         /**
-         * [bitmap] is pooled: it stays valid until two further onFrame calls
-         * (or [stop]) have replaced it, after which its pixels are reused for
-         * a later frame -- render it, don't keep it.
+         * [bitmap] is pooled: once a later onFrame (or [stop]) has replaced
+         * it and two display frames have passed, its pixels are reused for a
+         * later frame -- render it, don't keep it.
          */
         fun onFrame(bitmap: Bitmap)
 
@@ -84,11 +85,8 @@ class MjpegClient(private val listener: Listener) {
      */
     private val bitmapPool = ConcurrentLinkedQueue<Bitmap>()
 
-    // Main-thread only. A bitmap goes back to the pool only once it is two
-    // deliveries old: the frame just replaced may still be referenced by a
-    // RenderThread frame in flight, so decoding into it immediately could tear.
+    // Main-thread only: the bitmap most recently handed to the listener.
     private var displayedFrame: Bitmap? = null
-    private var retiringFrame: Bitmap? = null
 
     /** (Re)starts the client against this endpoint. Safe to call again while already running -- the next (re)connect attempt picks up the new endpoint (token rotation). */
     fun start(host: String, port: Int, token: String) {
@@ -116,7 +114,6 @@ class MjpegClient(private val listener: Listener) {
         // these anymore. Drop them so a stopped stream holds no frame memory.
         pendingFrame.set(null)
         displayedFrame = null
-        retiringFrame = null
         bitmapPool.clear()
     }
 
@@ -205,6 +202,9 @@ class MjpegClient(private val listener: Listener) {
     }
 
     private fun handleFrame(frame: ByteArray, gen: Int) {
+        // A stopped worker can still be draining a buffered chunk; its frames
+        // must not displace (and pool) the live worker's pending frame.
+        if (!isLive(gen)) return
         val bitmap = decode(frame) ?: return
         val superseded = pendingFrame.getAndSet(bitmap)
         if (superseded != null) {
@@ -218,10 +218,24 @@ class MjpegClient(private val listener: Listener) {
             // before stop() must not repaint a view the caller has cleared.
             val next = pendingFrame.getAndSet(null) ?: return@post
             if (!isLive(gen)) return@post
-            retiringFrame?.let { bitmapPool.offer(it) }
-            retiringFrame = displayedFrame
+            displayedFrame?.let { retire(it, gen) }
             displayedFrame = next
             listener.onFrame(next)
+        }
+    }
+
+    /**
+     * Returns a replaced frame to the pool only after two vsync frame
+     * callbacks. The RenderThread may still be uploading it for a frame
+     * synced before the replacement; the first callback's frame then syncs
+     * the new bitmap (which waits for that earlier draw to finish), so by the
+     * second callback nothing can read the old pixels and decoding into it
+     * can't tear. Counting deliveries instead gave no such guarantee.
+     */
+    private fun retire(bitmap: Bitmap, gen: Int) {
+        val choreographer = Choreographer.getInstance() // main thread: this runs inside the delivery post
+        choreographer.postFrameCallback {
+            choreographer.postFrameCallback { if (isLive(gen)) bitmapPool.offer(bitmap) }
         }
     }
 
