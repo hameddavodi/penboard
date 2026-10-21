@@ -132,7 +132,13 @@ final class MJPEGServer: NSObject, @unchecked Sendable {
             content: part,
             completion: .contentProcessed { [weak self] error in
                 guard let self else { return }
-                self.queue.async { self.isSending = false }
+                // `isSending` belongs to the current client only. A replaced
+                // client's late completion (adopt() already reset the flag and
+                // may have the replay frame in flight) must not clear it, or
+                // the next push would stack a second send behind that one.
+                self.queue.async {
+                    if self.client === client { self.isSending = false }
+                }
                 if let error {
                     self.log.error("Frame send failed: \(String(describing: error), privacy: .public)")
                 }

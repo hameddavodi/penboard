@@ -48,6 +48,11 @@ final class CursorInjector {
     /// Consumes one POINT_BATCH's points in order (Laser mode only —
     /// `PenBoardApp` routes packets here instead of `CanvasView` while in Laser).
     func handle(points: [Point]) {
+        // A batch's points all arrive at once, so consecutive hover moves would
+        // be posted back-to-back with only the last one ever visible. Run the
+        // low-pass over every sample (same filter state as before) but post one
+        // mouseMoved per run, flushed before any other event to keep ordering.
+        var pendingHover: CGPoint?
         for point in points {
             guard let event = point.event else { continue }
             let target = CoordinateMapper.clamp(
@@ -55,9 +60,18 @@ final class CursorInjector {
                 to: cgDisplayFrame
             )
 
+            if event == .hoverMove || event == .hoverEnter {
+                pendingHover = lowPass(target)
+                continue
+            }
+            if let hover = pendingHover {
+                post(.mouseMoved, at: hover)
+                pendingHover = nil
+            }
+
             switch event {
             case .hoverMove, .hoverEnter:
-                post(.mouseMoved, at: lowPass(target))
+                break // handled (coalesced) above
 
             case .hoverExit:
                 break // nothing to inject; the cursor simply stays put
@@ -95,6 +109,7 @@ final class CursorInjector {
                 smoothed = target
             }
         }
+        if let pendingHover { post(.mouseMoved, at: pendingHover) }
     }
 
     /// Balances an unmatched `leftMouseDown` when the PEN_UP that should have

@@ -18,6 +18,8 @@ final class CanvasView: NSView {
     /// Barrel-button-held drag state (object eraser, D3).
     private var isErasing = false
 
+    /// Armed only while a stroke is open (started on PEN_DOWN, cancelled once
+    /// no stroke is open), so an idle overlay never wakes the CPU.
     private var stallTimer: DispatchSourceTimer?
     /// PROTOCOL §4: force-close an open stroke after 500 ms without new points.
     private static let stallInterval: TimeInterval = 0.5
@@ -40,7 +42,6 @@ final class CanvasView: NSView {
         super.init(frame: frameRect)
         wantsLayer = true
         layer?.backgroundColor = NSColor.clear.cgColor
-        startStallTimer()
     }
 
     required init?(coder: NSCoder) {
@@ -92,6 +93,7 @@ final class CanvasView: NSView {
                 } else {
                     isErasing = false
                     let stroke = strokeStore.beginStroke(color: color, baseWidth: baseWidth)
+                    startStallTimerIfNeeded()
                     if let dirty = stroke.append(position: mapped, pressure: normalizedPressure(point)) {
                         setNeedsDisplay(dirty)
                     }
@@ -177,7 +179,8 @@ final class CanvasView: NSView {
 
     // MARK: Stall force-close (PROTOCOL §4)
 
-    private func startStallTimer() {
+    private func startStallTimerIfNeeded() {
+        guard stallTimer == nil else { return }
         let timer = DispatchSource.makeTimerSource(queue: .main)
         timer.schedule(deadline: .now() + 0.15, repeating: 0.15)
         timer.setEventHandler { [weak self] in
@@ -192,12 +195,22 @@ final class CanvasView: NSView {
         timer.resume()
     }
 
+    private func stopStallTimer() {
+        stallTimer?.cancel()
+        stallTimer = nil
+    }
+
     private func checkStall() {
-        guard let open = strokeStore.openStroke else { return }
+        // Nothing open (closed by PEN_UP, gap, clear…): disarm until the next stroke.
+        guard let open = strokeStore.openStroke else {
+            stopStallTimer()
+            return
+        }
         if Date().timeIntervalSince(open.lastUpdate) > Self.stallInterval {
             log.info("Force-closing stalled stroke (500 ms without points)")
             strokeStore.closeOpenStroke()
             isErasing = false
+            stopStallTimer()
         }
     }
 
