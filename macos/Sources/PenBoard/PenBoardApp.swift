@@ -137,6 +137,11 @@ final class PenBoardApp: NSObject, NSApplicationDelegate {
             // refused request.
             central.updateLocalState(mode: mode.rawValue, color: colorIndex, width: baseWidth)
             central.sendControl(.setMode(mode.rawValue))
+            // At launch with a persisted Laser pref, this refusal is the very
+            // first applyMode call: `mode` is still the initial .draw but the
+            // overlay was never ordered front, so Draw would silently render
+            // nothing. Idempotent when the overlay is already showing.
+            if mode == .draw { overlayWindow.orderFrontRegardless() }
             return
         }
         statusMenu.setAccessibilityHintVisible(false)

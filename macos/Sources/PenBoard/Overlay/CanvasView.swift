@@ -265,6 +265,10 @@ final class CanvasView: NSView {
         let bakeable = (strokes.last?.isOpen == true) ? strokes.count - 1 : strokes.count
         guard bakedStrokeCount < bakeable else { return }
 
+        // Drop the snapshot BEFORE writing: `makeImage()` is copy-on-write, so
+        // drawing into the context while the old image is still referenced
+        // forces a full-bitmap copy (~60 MB on a 5K display) on every stroke end.
+        cachedImage = nil
         NSGraphicsContext.saveGraphicsState()
         NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: false)
         while bakedStrokeCount < bakeable {
@@ -274,7 +278,6 @@ final class CanvasView: NSView {
             bakedStrokeCount += 1
         }
         NSGraphicsContext.restoreGraphicsState()
-        cachedImage = nil // baked content changed — regenerate the snapshot
     }
 
     /// Discards the baked cache after a removal (undo/erase/clear); the next

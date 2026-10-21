@@ -30,6 +30,7 @@ final class ScreenStreamer: NSObject, @unchecked Sendable {
     /// Reused across frames — creating a fresh `CIContext` per frame is the
     /// classic perf mistake this avoids (context setup is not cheap).
     private let ciContext = CIContext(options: nil)
+    private let jpegColorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
 
     private var stream: SCStream?
     /// C4 backpressure: guards against re-entering the (synchronous) JPEG
@@ -73,13 +74,13 @@ final class ScreenStreamer: NSObject, @unchecked Sendable {
                     guard let display = content.displays.first(where: { $0.displayID == displayID })
                     else {
                         self.log.error("No capturable display found (requested id \(displayID, privacy: .public))")
-                        self.onStopped?(nil)
+                        self.reportStopped(nil, generation: generation)
                         return
                     }
                     self.beginCapture(on: display, generation: generation)
                 } catch {
                     self.log.error("SCShareableContent fetch failed: \(String(describing: error), privacy: .public)")
-                    self.onStopped?(error)
+                    self.reportStopped(error, generation: generation)
                 }
             }
         }
@@ -121,7 +122,7 @@ final class ScreenStreamer: NSObject, @unchecked Sendable {
             try newStream.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
         } catch {
             log.error("addStreamOutput failed: \(String(describing: error), privacy: .public)")
-            onStopped?(error)
+            reportStopped(error, generation: generation)
             return
         }
         var stale = false
@@ -139,7 +140,7 @@ final class ScreenStreamer: NSObject, @unchecked Sendable {
             guard let self else { return }
             if let error {
                 self.log.error("startCapture failed: \(String(describing: error), privacy: .public)")
-                self.onStopped?(error)
+                self.reportStopped(error, generation: generation)
                 return
             }
             // A teardown could also land between the assignment above and
@@ -150,6 +151,18 @@ final class ScreenStreamer: NSObject, @unchecked Sendable {
                     newStream.stopCapture(completionHandler: nil)
                 }
             }
+        }
+    }
+
+    /// Fires `onStopped` on `queue` — but only if `generation` is still the
+    /// live session. A failure from a superseded setup (display switch /
+    /// re-toggle while the old one was still resolving) must not tear down
+    /// the newer, healthy capture.
+    private func reportStopped(_ error: Error?, generation: Int) {
+        nonisolated(unsafe) let error = error
+        queue.async { [weak self] in
+            guard let self, generation == self.captureGeneration else { return }
+            self.onStopped?(error)
         }
     }
 
@@ -185,12 +198,11 @@ extension ScreenStreamer: SCStreamOutput {
         defer { isEncoding = false }
 
         let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
-        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
         let qualityKey = CIImageRepresentationOption(rawValue: kCGImageDestinationLossyCompressionQuality as String)
         guard
             let data = ciContext.jpegRepresentation(
                 of: ciImage,
-                colorSpace: colorSpace,
+                colorSpace: jpegColorSpace,
                 options: [qualityKey: Self.jpegQuality]
             )
         else { return }
@@ -218,7 +230,13 @@ extension ScreenStreamer: SCStreamDelegate {
 
     func stream(_ stream: SCStream, didStopWithError error: any Error) {
         log.error("Stream stopped with error: \(String(describing: error), privacy: .public)")
-        queue.async { [weak self] in self?.stream = nil }
-        onStopped?(error)
+        nonisolated(unsafe) let error = error
+        queue.async { [weak self] in
+            // Only the live stream's death matters: a superseded stream's late
+            // error must neither nil out its replacement nor stop the session.
+            guard let self, self.stream === stream else { return }
+            self.stream = nil
+            self.onStopped?(error)
+        }
     }
 }

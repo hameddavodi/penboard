@@ -39,6 +39,12 @@ final class MJPEGServer: NSObject, @unchecked Sendable {
     /// only the latest frame is ever queued for a slow client, never a
     /// growing buffer.
     private var isSending = false
+    /// Most recent frame, replayed to a newly adopted client. ScreenCaptureKit
+    /// only delivers `.complete` frames when the screen changes, so without
+    /// this a tablet connecting to a static screen (a slide, a paused video)
+    /// stays blank until something on the Mac moves. Cleared on teardown so a
+    /// frame never outlives its token.
+    private var lastFrame: Data?
 
     /// Surfaced so `StreamController` (A6) can react to listener failures
     /// (e.g. the OS refusing to bind/advertise) the same way
@@ -110,20 +116,28 @@ final class MJPEGServer: NSObject, @unchecked Sendable {
     /// `queue` itself before touching any state.
     func push(frame: Data) {
         queue.async { [weak self] in
-            guard let self, let client = self.client, !self.isSending else { return }
-            self.isSending = true
-            let part = MJPEGWire.part(jpeg: frame)
-            client.send(
-                content: part,
-                completion: .contentProcessed { [weak self] error in
-                    guard let self else { return }
-                    self.queue.async { self.isSending = false }
-                    if let error {
-                        self.log.error("Frame send failed: \(String(describing: error), privacy: .public)")
-                    }
-                }
-            )
+            guard let self, self.listener != nil else { return }
+            self.lastFrame = frame
+            guard let client = self.client else { return }
+            self.send(frame, to: client)
         }
+    }
+
+    /// C4 backpressure: drops `frame` if a send is still in flight.
+    private func send(_ frame: Data, to client: NWConnection) {
+        guard !isSending else { return }
+        isSending = true
+        let part = MJPEGWire.part(jpeg: frame)
+        client.send(
+            content: part,
+            completion: .contentProcessed { [weak self] error in
+                guard let self else { return }
+                self.queue.async { self.isSending = false }
+                if let error {
+                    self.log.error("Frame send failed: \(String(describing: error), privacy: .public)")
+                }
+            }
+        )
     }
 
     /// Must only run confined to `queue` (via `queue.sync` above, or already
@@ -132,6 +146,7 @@ final class MJPEGServer: NSObject, @unchecked Sendable {
         client?.cancel()
         client = nil
         isSending = false
+        lastFrame = nil
         for pending in pendingConnections { pending.cancel() }
         pendingConnections.removeAll()
         listener?.cancel()
@@ -217,6 +232,7 @@ final class MJPEGServer: NSObject, @unchecked Sendable {
             }
         )
         log.info("Streaming client connected")
+        if let lastFrame { send(lastFrame, to: connection) }
     }
 
     /// C3: wrong method/path/token -> 404 + close immediately, no body.
