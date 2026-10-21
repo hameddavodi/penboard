@@ -146,7 +146,12 @@ class PenBoardService : Service() {
             ContextCompat.RECEIVER_NOT_EXPORTED,
         )
         receiverRegistered = true
-        startBleStack()
+        // No startBleStack() here: this service is only ever started via
+        // startForegroundService (or a START_STICKY restart), so onStartCommand
+        // always follows and its ensureBleStackRunning() builds the stack.
+        // Building it here too made that first onStartCommand see an idle,
+        // freshly-built stack and immediately tear it down and rebuild it --
+        // a double advertise/rename/GATT-open on every cold start.
     }
 
     /**
@@ -214,6 +219,9 @@ class PenBoardService : Service() {
                         // callback arrives on a binder thread.
                         mainHandler.post {
                             if (deviceName != null) {
+                                // A re-advertise still pending from an earlier
+                                // drop would broadcast over the live link.
+                                mainHandler.removeCallbacksAndMessages(READVERTISE_TOKEN)
                                 everConnected = true
                                 reconnectBackoffMs = INITIAL_RECONNECT_BACKOFF_MS
                                 updateStatus { it.copy(connectedDeviceName = deviceName, reconnecting = false) }
@@ -284,6 +292,7 @@ class PenBoardService : Service() {
 
     /** Tears down and rebuilds the whole BLE stack -- used when the existing GATT server/advertiser handle may be stale rather than trusted. */
     private fun restartBleStack() {
+        mainHandler.removeCallbacksAndMessages(READVERTISE_TOKEN)
         penAdvertiser?.stop()
         penGattServer?.stop()
         penAdvertiser = null
@@ -319,6 +328,9 @@ class PenBoardService : Service() {
 
     /** Re-advertises after a disconnect with exponential backoff (M4.1: "sensible retry"), capped and reset on success. */
     private fun scheduleReadvertise() {
+        // At most one pending re-advertise: back-to-back drops (or a failure
+        // retry racing a fresh drop) used to stack parallel retry chains.
+        mainHandler.removeCallbacksAndMessages(READVERTISE_TOKEN)
         mainHandler.postDelayed(
             {
                 val advertiser = penAdvertiser ?: return@postDelayed
@@ -332,6 +344,7 @@ class PenBoardService : Service() {
                     }
                 }
             },
+            READVERTISE_TOKEN,
             reconnectBackoffMs,
         )
     }
@@ -409,6 +422,7 @@ class PenBoardService : Service() {
         /** Re-advertise retry backoff after a disconnect (M4.1: "sensible retry"), doubling up to the cap. */
         private const val INITIAL_RECONNECT_BACKOFF_MS = 1_000L
         private const val MAX_RECONNECT_BACKOFF_MS = 16_000L
+        private val READVERTISE_TOKEN = Any()
 
         fun bindingIntent(context: Context): Intent = Intent(context, PenBoardService::class.java)
     }

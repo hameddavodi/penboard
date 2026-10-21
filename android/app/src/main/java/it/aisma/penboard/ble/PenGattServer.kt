@@ -29,6 +29,7 @@ import it.aisma.penboard.proto.Packets
 import it.aisma.penboard.proto.PenPoint
 import it.aisma.penboard.proto.asHello
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * GATT server for the PenBoard service (PROTOCOL §1): STREAM (notify-only,
@@ -85,6 +86,7 @@ class PenGattServer(private val callback: Callback) {
     @Volatile private var pingSeenThisSession = false
 
     private val controlOutbox = ArrayDeque<ByteArray>()
+    private val sendRetryScheduled = AtomicBoolean(false)
     private val malformedTimestamps = ArrayDeque<Long>()
 
     // @Volatile: reassigned on every (re)connect from a binder thread while the
@@ -156,6 +158,10 @@ class PenGattServer(private val callback: Callback) {
             }
 
             override fun onMtuChanged(device: BluetoothDevice, mtu: Int) {
+                // A refused second central can still negotiate its own MTU
+                // before its cancelConnection lands; adopting it would size
+                // the active link's batches for someone else's link.
+                if (device != connectedDevice) return
                 currentMtu = mtu
                 Log.i(TAG, "ATT MTU negotiated: $mtu")
             }
@@ -186,7 +192,10 @@ class PenGattServer(private val callback: Callback) {
                 offset: Int,
                 value: ByteArray,
             ) {
-                if (characteristic.uuid != CONTROL_CHARACTERISTIC_UUID) {
+                if (characteristic.uuid != CONTROL_CHARACTERISTIC_UUID || device != connectedDevice) {
+                    // Non-CONTROL, or a write from a refused second central
+                    // racing its cancelConnection: it must never drive the
+                    // active session's handshake/toolbar state.
                     if (responseNeeded) {
                         gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED, offset, null)
                     }
@@ -208,6 +217,12 @@ class PenGattServer(private val callback: Callback) {
                 offset: Int,
                 value: ByteArray,
             ) {
+                if (device != connectedDevice) {
+                    if (responseNeeded) {
+                        gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED, offset, null)
+                    }
+                    return
+                }
                 val enable =
                     value.contentEquals(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE) ||
                         value.contentEquals(BluetoothGattDescriptor.ENABLE_INDICATION_VALUE)
@@ -260,6 +275,7 @@ class PenGattServer(private val callback: Callback) {
     @SuppressLint("MissingPermission") // permission verified upstream by BlePermissions before start()
     fun stop() {
         keepaliveHandler.removeCallbacks(keepaliveCheck)
+        keepaliveHandler.removeCallbacks(sendRetry)
         gattServer?.close()
         gattServer = null
         connectedDevice = null
@@ -282,8 +298,18 @@ class PenGattServer(private val callback: Callback) {
         }
     }
 
-    /** Feeds one captured pen/hover sample into the STREAM pacing queue (PadView -> NotifyQueue). */
+    /**
+     * Feeds one captured pen/hover sample into the STREAM pacing queue
+     * (PadView -> NotifyQueue). Points are discarded outright while STREAM
+     * can't deliver (no link, HELLO not yet answered, or the Mac hasn't
+     * subscribed -- it only does so after the user passes the trust dialog,
+     * PROTOCOL §6.7). Queuing them instead let PEN_DOWN/PEN_UP/HOVER_*,
+     * which the drop policy never evicts, pile up without bound for as long
+     * as the pairing dialog sat open, then flush as a phantom burst of dots
+     * the moment STREAM was subscribed.
+     */
     fun enqueuePoint(point: PenPoint) {
+        if (connectedDevice == null || !streamGateOpen || !streamSubscribed) return
         notifyQueue.enqueue(point)
     }
 
@@ -371,7 +397,10 @@ class PenGattServer(private val callback: Callback) {
         val device = connectedDevice ?: return false
         val characteristic = streamCharacteristic ?: return false
         if (!streamGateOpen || !streamSubscribed) return false
-        if (!notify(device, characteristic, bytes)) return false
+        if (!notify(device, characteristic, bytes)) {
+            scheduleSendRetry()
+            return false
+        }
         notificationInFlight = true
         return true
     }
@@ -390,7 +419,22 @@ class PenGattServer(private val callback: Callback) {
         if (notify(device, characteristic, next)) {
             controlOutbox.removeFirst()
             notificationInFlight = true
+        } else {
+            scheduleSendRetry()
         }
+    }
+
+    /**
+     * The stack can reject a notify with nothing of ours in flight (API 33+
+     * returns ERROR_GATT_WRITE_REQUEST_BUSY while its own queue drains), and
+     * then no onNotificationSent will ever arrive to pump the outbox again.
+     * Without a retry, a rejected HELLO_OK stalled the handshake until the
+     * 90 s watchdog, a rejected PONG cost the link, and a rejected PEN_UP sat
+     * buffered until the next pen event. Coalesced: at most one pending retry.
+     */
+    private fun scheduleSendRetry() {
+        if (!sendRetryScheduled.compareAndSet(false, true)) return
+        keepaliveHandler.postDelayed(sendRetry, SEND_RETRY_DELAY_MS)
     }
 
     private fun handleNotificationSent(device: BluetoothDevice) {
@@ -408,6 +452,15 @@ class PenGattServer(private val callback: Callback) {
             pumpControlOutbox(device) // CONTROL (handshake/keepalive) takes priority...
         }
         notifyQueue.onNotificationSent() // ...then STREAM gets its turn if the gate is still free.
+    }
+
+    // Same split-lock shape as handleNotificationSent: never hold `this` while
+    // calling into NotifyQueue (lock order stays NotifyQueue -> PenGattServer).
+    private val sendRetry = Runnable {
+        sendRetryScheduled.set(false)
+        val device = connectedDevice ?: return@Runnable
+        synchronized(this) { pumpControlOutbox(device) }
+        notifyQueue.retry()
     }
 
     @SuppressLint("MissingPermission") // permission verified upstream by BlePermissions before start()
@@ -534,6 +587,7 @@ class PenGattServer(private val callback: Callback) {
          */
         private const val HANDSHAKE_GRACE_MS = 90_000L
         private const val KEEPALIVE_CHECK_INTERVAL_MS = 2_000L
+        private const val SEND_RETRY_DELAY_MS = 20L
 
         val SERVICE_UUID: UUID = UUID.fromString("C5F1A9E2-7B34-4E86-9D12-8A50C3B7F6D4")
         val STREAM_CHARACTERISTIC_UUID: UUID = UUID.fromString("C5F1A9E3-7B34-4E86-9D12-8A50C3B7F6D4")

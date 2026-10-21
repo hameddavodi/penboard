@@ -47,6 +47,16 @@ class NotifyQueue(
         flushIfIdle()
     }
 
+    /**
+     * Re-attempts a flush after [send] rejected a batch with nothing in
+     * flight (stack busy). Unlike [onNotificationSent], never clears an
+     * in-flight notification, so it can't break the one-in-flight pacing.
+     */
+    @Synchronized
+    fun retry() {
+        flushIfIdle()
+    }
+
     @Synchronized
     fun pendingCount(): Int = pending.size
 
