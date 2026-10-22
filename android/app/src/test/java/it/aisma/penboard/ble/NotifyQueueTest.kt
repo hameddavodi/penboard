@@ -154,4 +154,35 @@ class NotifyQueueTest {
         assertEquals(2, sent.size)
         assertEquals(listOf(2, 3), decodeBatch(sent[1]).map { it.x })
     }
+
+    @Test
+    fun `retry re-sends a batch the stack rejected without advancing seq`() {
+        var accept = false
+        val sent = mutableListOf<ByteArray>()
+        val queue = NotifyQueue(maxPointsPerBatch = { 25 }, send = { if (accept) sent.add(it); accept })
+
+        queue.enqueue(move(1)) // stack busy: rejected, kept pending
+        assertEquals(0, sent.size)
+        assertEquals(1, queue.pendingCount())
+
+        accept = true
+        queue.retry()
+
+        assertEquals(1, sent.size)
+        assertEquals(listOf(1), decodeBatch(sent[0]).map { it.x })
+        assertEquals(0, (Packets.decode(sent[0]) as DecodeResult.PointBatch).packet.seq)
+    }
+
+    @Test
+    fun `retry never sends while a notification is still in flight`() {
+        val sent = mutableListOf<ByteArray>()
+        val queue = NotifyQueue(maxPointsPerBatch = { 25 }, send = { sent.add(it); true })
+
+        queue.enqueue(move(1)) // in flight
+        queue.enqueue(move(2)) // pending
+        queue.retry()
+
+        assertEquals(1, sent.size)
+        assertEquals(1, queue.pendingCount())
+    }
 }

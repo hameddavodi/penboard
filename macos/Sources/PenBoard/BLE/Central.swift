@@ -342,9 +342,20 @@ final class Central: NSObject, @unchecked Sendable {
         default:
             state = .pairing
         }
-        Task { @MainActor [weak self] in
+        onMain { $0.delegate?.central($0, didChangeState: state) }
+    }
+
+    /// Hops to the main actor in strict FIFO order. Separately created
+    /// `Task { @MainActor }`s make no ordering promise relative to each other,
+    /// but everything forwarded from here is order-sensitive: STREAM batches
+    /// build strokes / drive mouse down→drag→up, the seq-gap signal must land
+    /// before the batch that follows it, and state transitions must not
+    /// arrive inverted. `DispatchQueue.main` is FIFO, and skips a Task
+    /// allocation per 120 Hz batch.
+    private func onMain(_ body: @escaping @MainActor @Sendable (Central) -> Void) {
+        DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            self.delegate?.central(self, didChangeState: state)
+            MainActor.assumeIsolated { body(self) }
         }
     }
 
@@ -505,10 +516,7 @@ final class Central: NSObject, @unchecked Sendable {
         lastPingTimestamp = nil
         let rttMs = Date().timeIntervalSince(sentAt) * 1000
         log.info("RTT \(rttMs, privacy: .public) ms")
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            self.delegate?.central(self, didUpdateRTTMillis: rttMs)
-        }
+        onMain { $0.delegate?.central($0, didUpdateRTTMillis: rttMs) }
     }
 
     // MARK: INFO characteristic (§6 step 3)
@@ -591,10 +599,7 @@ final class Central: NSObject, @unchecked Sendable {
                 return
             }
             log.debug("Received tablet control opcode \(packet.opcode, privacy: .public)")
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                self.packetDelegate?.central(self, didReceiveTabletControl: packet)
-            }
+            onMain { $0.packetDelegate?.central($0, didReceiveTabletControl: packet) }
         case .error(let code):
             log.error("Peripheral reported ERROR(\(code, privacy: .public))")
         case .hello, .ping, .stateSync:
@@ -625,10 +630,7 @@ final class Central: NSObject, @unchecked Sendable {
         case .success(.pointBatch(let batch)):
             checkStreamSequenceGap(batch.seq)
             log.debug("STREAM batch seq=\(batch.seq, privacy: .public) count=\(batch.points.count, privacy: .public)")
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                self.packetDelegate?.central(self, didReceivePointBatch: batch)
-            }
+            onMain { $0.packetDelegate?.central($0, didReceivePointBatch: batch) }
         case .success(.control):
             recordMalformed(reason: "control packet received on STREAM characteristic")
         case .failure(.versionMismatch):
@@ -651,10 +653,7 @@ final class Central: NSObject, @unchecked Sendable {
         let expected = last &+ 1
         guard seq != expected else { return }
         log.error("STREAM seq gap: expected \(expected, privacy: .public), got \(seq, privacy: .public)")
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            self.packetDelegate?.centralDidDetectStreamSequenceGap(self)
-        }
+        onMain { $0.packetDelegate?.centralDidDetectStreamSequenceGap($0) }
     }
 }
 

@@ -5,6 +5,7 @@ import android.net.nsd.NsdServiceInfo
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import androidx.annotation.RequiresApi
 import android.util.Log
 import java.util.concurrent.Executor
 
@@ -32,6 +33,12 @@ import java.util.concurrent.Executor
  * "First service wins" (C1, Open Decision D-5): once one service has started
  * resolving, every other [NsdManager.DiscoveryListener.onServiceFound] is
  * ignored until that one is lost.
+ *
+ * Threading: all state here is main-thread confined. NsdManager delivers
+ * DiscoveryListener/ResolveListener callbacks on its own internal thread, so
+ * those hop to main first and then drop themselves if [stop] (or a newer
+ * [start]) has superseded their listener -- otherwise a callback already
+ * queued when the user toggled streaming off could resolve and restart it.
  */
 class StreamDiscovery(private val streamListener: Listener) {
 
@@ -69,28 +76,33 @@ class StreamDiscovery(private val streamListener: Listener) {
                     Log.i(TAG, "discovery started for $serviceType")
                 }
 
-                override fun onServiceFound(service: NsdServiceInfo) {
-                    if (activeServiceName != null) return // C1/D-5: first-wins, ignore any other Mac
+                override fun onServiceFound(service: NsdServiceInfo) = onMainIfCurrent {
+                    if (activeServiceName != null) return@onMainIfCurrent // C1/D-5: first-wins, ignore any other Mac
                     activeServiceName = service.serviceName
                     resolve(manager, service)
                 }
 
-                override fun onServiceLost(service: NsdServiceInfo) {
-                    if (service.serviceName != activeServiceName) return
+                override fun onServiceLost(service: NsdServiceInfo) = onMainIfCurrent {
+                    if (service.serviceName != activeServiceName) return@onMainIfCurrent
                     cancelActiveResolution()
                     activeServiceName = null
                     lastEmitted = null
-                    mainHandler.post { streamListener.onLost() }
+                    streamListener.onLost()
                 }
 
                 override fun onDiscoveryStopped(serviceType: String) {
                     Log.i(TAG, "discovery stopped for $serviceType")
                 }
 
-                override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) {
+                override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) = onMainIfCurrent {
                     Log.w(TAG, "start discovery failed: $errorCode")
                     runCatching { manager.stopServiceDiscovery(this) }
                     discoveryListener = null
+                }
+
+                /** Runs [body] on main, only if this listener is still the active discovery. */
+                private fun onMainIfCurrent(body: () -> Unit) {
+                    mainHandler.post { if (discoveryListener === this) body() }
                 }
 
                 override fun onStopDiscoveryFailed(serviceType: String, errorCode: Int) {
@@ -126,6 +138,7 @@ class StreamDiscovery(private val streamListener: Listener) {
         }
     }
 
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     private fun resolveModern(manager: NsdManager, service: NsdServiceInfo) {
         val callback =
             object : NsdManager.ServiceInfoCallback {
@@ -146,7 +159,7 @@ class StreamDiscovery(private val streamListener: Listener) {
                     activeServiceInfoCallback = null
                     activeServiceName = null
                     lastEmitted = null
-                    mainHandler.post { streamListener.onLost() }
+                    streamListener.onLost() // already on main (mainThreadExecutor)
                 }
 
                 override fun onServiceInfoCallbackUnregistered() {
@@ -165,16 +178,20 @@ class StreamDiscovery(private val streamListener: Listener) {
         val resolveListener =
             object : NsdManager.ResolveListener {
                 override fun onResolveFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
-                    if (activeResolveListener !== this) return
-                    Log.w(TAG, "resolveService failed: $errorCode")
-                    activeResolveListener = null
-                    activeServiceName = null
+                    mainHandler.post {
+                        if (activeResolveListener !== this) return@post
+                        Log.w(TAG, "resolveService failed: $errorCode")
+                        activeResolveListener = null
+                        activeServiceName = null
+                    }
                 }
 
                 override fun onServiceResolved(serviceInfo: NsdServiceInfo) {
-                    if (activeResolveListener !== this) return
-                    activeResolveListener = null
-                    handleResolved(serviceInfo)
+                    mainHandler.post {
+                        if (activeResolveListener !== this) return@post
+                        activeResolveListener = null
+                        handleResolved(serviceInfo)
+                    }
                 }
             }
         activeResolveListener = resolveListener
@@ -199,7 +216,7 @@ class StreamDiscovery(private val streamListener: Listener) {
         }
         if (endpoint == lastEmitted) return // no-op refresh -- nothing actually changed
         lastEmitted = endpoint
-        mainHandler.post { streamListener.onEndpoint(endpoint.host, endpoint.port, endpoint.token) }
+        streamListener.onEndpoint(endpoint.host, endpoint.port, endpoint.token) // always called on main
     }
 
     /** Pre-34: no cancel API for an in-flight resolveService() call -- the reference-identity guards inside its own callbacks discard it once it's no longer active. */
@@ -209,7 +226,10 @@ class StreamDiscovery(private val streamListener: Listener) {
         if (callback != null) {
             activeServiceInfoCallback = null
             val manager = nsdManager
-            if (manager != null) runCatching { manager.unregisterServiceInfoCallback(callback) }
+            // Only ever set by resolveModern, i.e. on API 34+; the check is for lint.
+            if (manager != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                runCatching { manager.unregisterServiceInfoCallback(callback) }
+            }
         }
     }
 

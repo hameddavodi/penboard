@@ -5,11 +5,13 @@ import android.graphics.BitmapFactory
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import android.view.Choreographer
 import java.io.IOException
 import java.io.InputStream
 import java.net.InetSocketAddress
 import java.net.Socket
-import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Dials the Mac's MJPEG server (docs/EXECUTION-PLAN.md v1.1, contract C3)
@@ -34,6 +36,11 @@ class MjpegClient(private val listener: Listener) {
     enum class State { CONNECTING, STREAMING, WAITING }
 
     interface Listener {
+        /**
+         * [bitmap] is pooled: once a later onFrame (or [stop]) has replaced
+         * it and two display frames have passed, its pixels are reused for a
+         * later frame -- render it, don't keep it.
+         */
         fun onFrame(bitmap: Bitmap)
 
         fun onStateChanged(state: State)
@@ -63,9 +70,23 @@ class MjpegClient(private val listener: Listener) {
     /** The socket of the live worker, closed by [stop] to unblock a read in progress. */
     @Volatile private var activeSocket: Socket? = null
 
-    /** Coalescing hand-off to the main thread: only the newest decoded bitmap is ever delivered (C4), never a growing queue. */
-    private val framePosted = AtomicBoolean(false)
-    @Volatile private var latestBitmap: Bitmap? = null
+    /**
+     * Coalescing hand-off to the main thread: only the newest decoded bitmap
+     * is ever delivered (C4), never a growing queue. Non-null means a
+     * delivery is already posted and will pick up whatever is here.
+     */
+    private val pendingFrame = AtomicReference<Bitmap?>(null)
+
+    /**
+     * Decode targets for BitmapFactory's inBitmap. Allocating a fresh
+     * full-screen ARGB bitmap per frame (~9 MB at 1920x1200, ~12 fps) meant
+     * ~100 MB/s of garbage and GC pauses on the same main thread that
+     * renders the pen. Frames instead cycle through a few reusable bitmaps.
+     */
+    private val bitmapPool = ConcurrentLinkedQueue<Bitmap>()
+
+    // Main-thread only: the bitmap most recently handed to the listener.
+    private var displayedFrame: Bitmap? = null
 
     /** (Re)starts the client against this endpoint. Safe to call again while already running -- the next (re)connect attempt picks up the new endpoint (token rotation). */
     fun start(host: String, port: Int, token: String) {
@@ -89,6 +110,11 @@ class MjpegClient(private val listener: Listener) {
         activeSocket = null
         worker?.interrupt() // unblocks the backoff sleep
         worker = null
+        // The caller clears its view on stop; nothing on screen references
+        // these anymore. Drop them so a stopped stream holds no frame memory.
+        pendingFrame.set(null)
+        displayedFrame = null
+        bitmapPool.clear()
     }
 
     private fun isLive(gen: Int): Boolean = enabled && gen == generation
@@ -135,7 +161,7 @@ class MjpegClient(private val listener: Listener) {
             }
             postState(gen, State.STREAMING)
 
-            val parser = MjpegParser { frame -> handleFrame(frame) }
+            val parser = MjpegParser { frame -> handleFrame(frame, gen) }
             val chunk = ByteArray(READ_CHUNK_BYTES)
             while (isLive(gen)) {
                 val n = input.read(chunk)
@@ -175,20 +201,65 @@ class MjpegClient(private val listener: Listener) {
         return false // status line longer than any real response -- reject
     }
 
-    private fun handleFrame(frame: ByteArray) {
-        val bitmap = BitmapFactory.decodeByteArray(frame, 0, frame.size) ?: return
-        latestBitmap = bitmap
-        if (framePosted.compareAndSet(false, true)) {
-            mainHandler.post {
-                framePosted.set(false)
-                latestBitmap?.let { listener.onFrame(it) }
+    private fun handleFrame(frame: ByteArray, gen: Int) {
+        // A stopped worker can still be draining a buffered chunk; its frames
+        // must not displace (and pool) the live worker's pending frame.
+        if (!isLive(gen)) return
+        val bitmap = decode(frame) ?: return
+        val superseded = pendingFrame.getAndSet(bitmap)
+        if (superseded != null) {
+            // Never delivered, so never drawn: reusable right away. A
+            // delivery is already posted and will take the new bitmap.
+            bitmapPool.offer(superseded)
+            return
+        }
+        mainHandler.post {
+            // Checked here, not just at post time: a frame decoded just
+            // before stop() must not repaint a view the caller has cleared.
+            val next = pendingFrame.getAndSet(null) ?: return@post
+            if (!isLive(gen)) return@post
+            displayedFrame?.let { retire(it, gen) }
+            displayedFrame = next
+            listener.onFrame(next)
+        }
+    }
+
+    /**
+     * Returns a replaced frame to the pool only after two vsync frame
+     * callbacks. The RenderThread may still be uploading it for a frame
+     * synced before the replacement; the first callback's frame then syncs
+     * the new bitmap (which waits for that earlier draw to finish), so by the
+     * second callback nothing can read the old pixels and decoding into it
+     * can't tear. Counting deliveries instead gave no such guarantee.
+     */
+    private fun retire(bitmap: Bitmap, gen: Int) {
+        val choreographer = Choreographer.getInstance() // main thread: this runs inside the delivery post
+        choreographer.postFrameCallback {
+            choreographer.postFrameCallback { if (isLive(gen)) bitmapPool.offer(bitmap) }
+        }
+    }
+
+    private fun decode(frame: ByteArray): Bitmap? {
+        val options = BitmapFactory.Options().apply { inMutable = true }
+        val reusable = bitmapPool.poll()
+        if (reusable != null) {
+            options.inBitmap = reusable
+            try {
+                val bitmap = BitmapFactory.decodeByteArray(frame, 0, frame.size, options)
+                if (bitmap == null) bitmapPool.offer(reusable) // corrupt JPEG: keep it in rotation
+                return bitmap
+            } catch (_: IllegalArgumentException) {
+                // Frame no longer fits the pooled bitmap (Mac switched to a
+                // larger display). Let it go and decode into a fresh one.
+                options.inBitmap = null
             }
         }
+        return BitmapFactory.decodeByteArray(frame, 0, frame.size, options)
     }
 
     private fun postState(gen: Int, state: State) {
         if (!isLive(gen)) return // a superseded worker must not fight the live one over UI state
-        mainHandler.post { listener.onStateChanged(state) }
+        mainHandler.post { if (isLive(gen)) listener.onStateChanged(state) }
     }
 
     companion object {

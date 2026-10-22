@@ -28,8 +28,13 @@ final class ScreenStreamer: NSObject, @unchecked Sendable {
     private let log = Logger(subsystem: "it.aisma.penboard", category: "stream.capture")
     private let queue = DispatchQueue(label: "it.aisma.penboard.stream.capture")
     /// Reused across frames — creating a fresh `CIContext` per frame is the
-    /// classic perf mistake this avoids (context setup is not cheap).
-    private let ciContext = CIContext(options: nil)
+    /// classic perf mistake this avoids (context setup is not cheap). Colour
+    /// management is off: capture is configured to deliver sRGB already
+    /// (`colorSpaceName` below), so CI's default linearize -> working space ->
+    /// sRGB round trip would be two per-pixel conversions that change nothing.
+    /// Every frame is new, so caching intermediates only costs memory.
+    private let ciContext = CIContext(options: [.workingColorSpace: NSNull(), .cacheIntermediates: false])
+    private let jpegColorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
 
     private var stream: SCStream?
     /// C4 backpressure: guards against re-entering the (synchronous) JPEG
@@ -73,13 +78,13 @@ final class ScreenStreamer: NSObject, @unchecked Sendable {
                     guard let display = content.displays.first(where: { $0.displayID == displayID })
                     else {
                         self.log.error("No capturable display found (requested id \(displayID, privacy: .public))")
-                        self.onStopped?(nil)
+                        self.reportStopped(nil, generation: generation)
                         return
                     }
                     self.beginCapture(on: display, generation: generation)
                 } catch {
                     self.log.error("SCShareableContent fetch failed: \(String(describing: error), privacy: .public)")
-                    self.onStopped?(error)
+                    self.reportStopped(error, generation: generation)
                 }
             }
         }
@@ -113,6 +118,7 @@ final class ScreenStreamer: NSObject, @unchecked Sendable {
         config.height = size.height
         config.minimumFrameInterval = CMTime(value: 1, timescale: Self.targetFPS)
         config.pixelFormat = kCVPixelFormatType_32BGRA
+        config.colorSpaceName = CGColorSpace.sRGB // matches the JPEG's tag; see `ciContext`
         config.queueDepth = 4
         config.showsCursor = true
 
@@ -121,7 +127,7 @@ final class ScreenStreamer: NSObject, @unchecked Sendable {
             try newStream.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
         } catch {
             log.error("addStreamOutput failed: \(String(describing: error), privacy: .public)")
-            onStopped?(error)
+            reportStopped(error, generation: generation)
             return
         }
         var stale = false
@@ -135,11 +141,14 @@ final class ScreenStreamer: NSObject, @unchecked Sendable {
         // A teardown ran while this setup task was resolving content — the
         // stream was never started, so simply abandoning it here is enough.
         if stale { return }
+        // SCStream isn't Sendable; the box carries it into the @Sendable
+        // completion/queue hops below. Only touched on `queue` or by SCK itself.
+        let boxed = UncheckedSendableBox(newStream)
         newStream.startCapture { [weak self] error in
             guard let self else { return }
             if let error {
                 self.log.error("startCapture failed: \(String(describing: error), privacy: .public)")
-                self.onStopped?(error)
+                self.reportStopped(error, generation: generation)
                 return
             }
             // A teardown could also land between the assignment above and
@@ -147,9 +156,21 @@ final class ScreenStreamer: NSObject, @unchecked Sendable {
             // must be stopped, not leaked.
             self.queue.async {
                 if generation != self.captureGeneration {
-                    newStream.stopCapture(completionHandler: nil)
+                    boxed.value.stopCapture(completionHandler: nil)
                 }
             }
+        }
+    }
+
+    /// Fires `onStopped` on `queue` — but only if `generation` is still the
+    /// live session. A failure from a superseded setup (display switch /
+    /// re-toggle while the old one was still resolving) must not tear down
+    /// the newer, healthy capture.
+    private func reportStopped(_ error: Error?, generation: Int) {
+        // `any Error` is Sendable (Error refines Sendable), so it captures as is.
+        queue.async { [weak self] in
+            guard let self, generation == self.captureGeneration else { return }
+            self.onStopped?(error)
         }
     }
 
@@ -185,12 +206,11 @@ extension ScreenStreamer: SCStreamOutput {
         defer { isEncoding = false }
 
         let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
-        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
         let qualityKey = CIImageRepresentationOption(rawValue: kCGImageDestinationLossyCompressionQuality as String)
         guard
             let data = ciContext.jpegRepresentation(
                 of: ciImage,
-                colorSpace: colorSpace,
+                colorSpace: jpegColorSpace,
                 options: [qualityKey: Self.jpegQuality]
             )
         else { return }
@@ -218,7 +238,21 @@ extension ScreenStreamer: SCStreamDelegate {
 
     func stream(_ stream: SCStream, didStopWithError error: any Error) {
         log.error("Stream stopped with error: \(String(describing: error), privacy: .public)")
-        queue.async { [weak self] in self?.stream = nil }
-        onStopped?(error)
+        let failed = UncheckedSendableBox(stream)
+        queue.async { [weak self] in
+            // Only the live stream's death matters: a superseded stream's late
+            // error must neither nil out its replacement nor stop the session.
+            guard let self, self.stream === failed.value else { return }
+            self.stream = nil
+            self.onStopped?(error)
+        }
     }
+}
+
+/// Carries a non-Sendable reference (SCStream) across a `@Sendable` hop. Safe
+/// here because the value is only identity-compared or told to stop — both
+/// fine from any thread for SCStream — and never mutated through the box.
+private struct UncheckedSendableBox<Value>: @unchecked Sendable {
+    let value: Value
+    init(_ value: Value) { self.value = value }
 }
