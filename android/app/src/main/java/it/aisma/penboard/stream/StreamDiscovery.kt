@@ -5,6 +5,7 @@ import android.net.nsd.NsdServiceInfo
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import androidx.annotation.RequiresApi
 import android.util.Log
 import java.util.concurrent.Executor
 
@@ -137,6 +138,7 @@ class StreamDiscovery(private val streamListener: Listener) {
         }
     }
 
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     private fun resolveModern(manager: NsdManager, service: NsdServiceInfo) {
         val callback =
             object : NsdManager.ServiceInfoCallback {
@@ -224,7 +226,10 @@ class StreamDiscovery(private val streamListener: Listener) {
         if (callback != null) {
             activeServiceInfoCallback = null
             val manager = nsdManager
-            if (manager != null) runCatching { manager.unregisterServiceInfoCallback(callback) }
+            // Only ever set by resolveModern, i.e. on API 34+; the check is for lint.
+            if (manager != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                runCatching { manager.unregisterServiceInfoCallback(callback) }
+            }
         }
     }
 
