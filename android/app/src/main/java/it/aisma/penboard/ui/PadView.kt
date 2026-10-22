@@ -8,6 +8,7 @@ import android.graphics.Paint
 import android.util.AttributeSet
 import android.view.MotionEvent
 import android.view.View
+import androidx.core.graphics.createBitmap
 import it.aisma.penboard.proto.PenPoint
 import it.aisma.penboard.proto.PointEvent
 
@@ -112,7 +113,7 @@ constructor(context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
         if (w > 0 && h > 0) {
             activeRect = PadCoordinateMapper.activeRect(w, h)
             cacheBitmap?.recycle()
-            cacheBitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+            cacheBitmap = createBitmap(w, h)
             cacheCanvas = Canvas(cacheBitmap!!)
             bakedStrokeCount = 0
             // Stroke samples live in absolute view pixels (see pixelX/pixelY),
