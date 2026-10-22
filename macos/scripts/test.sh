@@ -38,4 +38,5 @@ if [ -d "$TESTING_LIB_DIR" ]; then
 fi
 
 cd "$(dirname "$0")/.."
-exec swift test "${EXTRA_FLAGS[@]}" "$@"
+# `${arr[@]+...}`: macOS bash 3.2 treats an empty array as unbound under `set -u`.
+exec swift test ${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"} "$@"
